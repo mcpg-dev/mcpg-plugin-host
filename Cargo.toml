@@ -1,0 +1,113 @@
+[package]
+name = "mcpg-plugin-host"
+version = "0.1.0-beta.13"
+license = "Apache-2.0"
+edition = "2024"
+description = "Plugin registry and loading infrastructure for MCPG"
+
+[features]
+default = []
+wasm = ["wasmtime", "wasmtime-wasi"]
+# FFI-equivalence test seam: exposes `NativeClusterAdapter::from_raw`
+# + `LoadedNativePlugin::synthetic` so an external test crate can wrap a
+# macro-built cluster vtable in the production host adapter without a
+# dlopen. Test-only; never enabled by the gateway build.
+cluster-ffi-test-seam = []
+
+[dependencies]
+mcpg-plugin-protocol = { git = "https://github.com/mcpg-dev/mcpg-plugin-protocol", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
+mcpg-cluster-api = { git = "https://github.com/mcpg-dev/mcpg-cluster-api", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
+abi_stable = "0.11"
+anyhow = "1.0"
+base64 = "0.22"
+ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
+hex = "0.4"
+metrics = "0.24"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+sha2 = "0.10"
+# Canonical-JSON content hashes for transform pre/post pairs so
+# auditors can replay the chain without the audit lane carrying
+# plaintext request/response payloads.
+blake3 = "1"
+tempfile = "3.10"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+oci-client = { version = "0.16", default-features = false, features = ["rustls-tls"] }
+thiserror = "1.0"
+tracing = "0.1"
+async-trait = "0.1"
+libloading = "0.8"
+# Audit-event helpers: uuid for event_id (v7 is
+# time-sortable — ideal for ordered audit streams) + chrono for
+# RFC3339 `occurred_at` formatting. Plugin-protocol stays clean;
+# only the host crate needs these.
+uuid = { version = "1", features = ["v7"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# The cache-metering decorator needs `bytes::Bytes` to
+# mirror the Cache trait signature.
+bytes = "1"
+# The native cluster_backend adapter returns an empty
+# `BoxPeerEventStream` for deferred `watch_peers` — needs `Stream`
+# trait in regular deps, not just dev-deps.
+futures-core = { version = "0.3", default-features = false, features = ["std"] }
+# Secret rotation: the gateway-side watch loop needs
+# `Stream::next` + `select!` arms over a cancellation token. The
+# `futures` umbrella is the cheapest way to pull `StreamExt`
+# without re-implementing the polling glue; `tokio-util` provides
+# the cancellation primitive credential-revocation already uses.
+futures = { version = "0.3", default-features = false, features = ["std"] }
+tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
+tokio = { version = "1", features = ["time", "rt-multi-thread", "sync", "macros"] }
+# Cluster credential cache event encryption:
+# operators supply a 32-byte symmetric key; the cache wraps each
+# `CacheEvent` with XChaCha20-Poly1305 before publish so credential
+# bytes don't leak to peers without TLS on their cluster transport.
+# 24-byte nonce makes random nonces safe at cache-event volumes
+# (collision risk negligible).
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc", "rand_core"] }
+rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
+zeroize = { version = "1", default-features = false, features = ["zeroize_derive"] }
+# wasmtime + wasmtime-wasi MUST share a major: wasmtime-wasi pulls its
+# matching wasmtime internally, so a split pin puts two incompatible
+# wasmtime crates in the tree and the `wasm` feature stops compiling
+# (Linker/WasiView/Error type mismatches). The exact `=` pin on
+# wasmtime-wasi forces the matching wasmtime and keeps both on one major.
+# 44.0.2 is the security floor: it closes the guest-controlled
+# table-allocation panic advisory. wasm.rs carries a local
+# `WasmtimeResultExt` shim because wasmtime exposes its own non-std Error
+# type, so `anyhow::Context` does not apply to `Result<T, wasmtime::Error>`.
+# `wasm` is an opt-in feature; stock builds don't pull wasmtime at all.
+wasmtime = { version = "44", optional = true, default-features = false, features = ["cranelift", "component-model", "runtime"] }
+wasmtime-wasi = { version = "=44.0.2", optional = true, default-features = false, features = ["p2"] }
+
+[dev-dependencies]
+# `ffi_matrix` marshaling micro-bench: binary-serialization (raw bytes)
+# midpoint between JSON and zero-serialization typed structs.
+bincode = "1"
+tempfile = "3.10"
+tokio = { version = "1", features = ["macros", "rt", "time", "rt-multi-thread", "test-util"] }
+# Validates every in-tree `plugin*.yaml` against `libs/plugin-protocol/
+# schema/plugin.v1.json` in the `plugin_yaml_schema` integration test —
+# catches drift between the normative schema and shipped descriptors.
+jsonschema = { version = "0.28", default-features = false }
+walkdir = "2"
+# `http_route` registry tests construct `HttpRouteRequest` literals
+# with an empty `bytes::Bytes` body; shared with plugin-protocol.
+bytes = "1"
+# `cluster_backend` registry tests construct empty `BoxPeerEventStream`
+# / `BoxPublishedMessageStream` handles; `futures-core` gives us `Stream`
+# without pulling the full `futures` crate.
+futures-core = { version = "0.3", default-features = false, features = ["std"] }
+# FFI round-trip benches (apps/gateway/docs/benchmark-modernization.md).
+# The bench dlopens a separately-built bench-noop cdylib by path, so it is
+# NOT a crate dependency (keeps the plugin-sdk → plugin-host graph cycle-free).
+criterion = { version = "0.5", features = ["html_reports"] }
+# `futures::StreamExt` to drain the BackendChunkStream in the streaming bench.
+futures = "0.3"
+# iai-callgrind: deterministic instruction-count benches (needs valgrind +
+# the matching `iai-callgrind-runner` binary installed locally:
+#   cargo install iai-callgrind-runner --version 0.16.1
+# The eventual CI regression gate; usable locally today.
+iai-callgrind = "0.16.1"
+

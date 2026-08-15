@@ -1,0 +1,224 @@
+// WIT (Wasm Interface Type) definition for MCPG plugin contracts.
+//
+// This defines the interface between the gateway host and Wasm guest plugins.
+// Plugins compiled to wasm32-wasip2 implement the "guest" world.
+// The gateway loads them via wasmtime and calls through these interfaces.
+
+package mcpg:plugin@0.1.0;
+
+/// Types shared across all plugin interfaces.
+interface types {
+    /// Identity of the requester (resolved by the gateway before plugins run).
+    record plugin-identity {
+        kind: string,
+        trust-level: string,
+        subject-id: option<string>,
+        auth-provider: option<string>,
+        issuer: option<string>,
+        roles: list<string>,
+        groups: list<string>,
+        scopes: list<string>,
+        /// Arbitrary attributes from token claim mappings (T7-08).
+        attributes: list<tuple<string, string>>,
+    }
+
+    /// Context for a plugin invocation — provided by the gateway host.
+    record plugin-context {
+        request-id: string,
+        session-id: option<string>,
+        tool-name: string,
+        /// MCP surface being dispatched (T9-02 / native T4-02). One of
+        /// "tool", "prompt", "resource", "resource_template",
+        /// "completion", "control_plane". Wasm plugins can filter on
+        /// this the same way native plugins do.
+        surface: string,
+        identity: plugin-identity,
+        transport: string,
+    }
+
+    /// Plugin manifest — every plugin declares this at load time.
+    record plugin-manifest {
+        id: string,
+        version: string,
+        name: string,
+        plugin-class: string,
+        /// Semver (e.g. "1.0") of the plugin protocol this plugin
+        /// targets. Host rejects load if the value is not within
+        /// its supported range.
+        protocol-version: string,
+    }
+
+    /// Payload for a tool-gate `allow` decision.
+    ///
+    /// T4-04: reaches parity with the native `GateDecision::Allow` surface so
+    /// Wasm plugins can request argument rewrites (pre-dispatch) or result
+    /// rewrites (post-dispatch), the same mutations native plugins can
+    /// express. All three fields are JSON strings (the host decodes and
+    /// validates them). Plugins that only want to pass metadata through can
+    /// leave `modified-arguments` and `modified-result` unset.
+    record gate-allow {
+        /// JSON object merged into `_meta` on the allowed response.
+        metadata: option<string>,
+        /// When set on a pre-dispatch evaluation, replaces the tool
+        /// arguments for the remainder of the pipeline.
+        modified-arguments: option<string>,
+        /// When set on a post-dispatch evaluation, replaces the tool result
+        /// before it is returned to the client.
+        modified-result: option<string>,
+    }
+
+    /// Decision returned by tool-gate plugins.
+    variant gate-decision {
+        /// Allow the request to proceed (optionally with metadata / rewrites).
+        allow(gate-allow),
+        /// Deny the request with a structured error.
+        deny(gate-denial),
+        /// Issue a challenge (e.g. payment required).
+        challenge(gate-challenge),
+    }
+
+    record gate-denial {
+        http-status: u16,
+        code: s32,
+        message: string,
+        error-data: option<string>,   // JSON
+    }
+
+    record gate-challenge {
+        http-status: u16,
+        code: s32,
+        message: string,
+        challenge-data: string,        // JSON
+    }
+
+    /// Result of a transform operation.
+    variant transform-result {
+        /// No changes to the value.
+        unchanged,
+        /// Modified value (JSON string).
+        modified(string),
+        /// Transform error.
+        error(string),
+    }
+
+    /// Result of an identity resolution.
+    variant identity-resolution {
+        /// Identity resolved successfully.
+        resolved(plugin-identity),
+        /// No token/credential found in headers.
+        none,
+        /// Token found but invalid.
+        invalid(string),
+    }
+}
+
+/// Tool gate plugin interface — pre/post-dispatch gating.
+///
+/// Plugins implementing this interface can inspect, allow, deny, or
+/// challenge tool calls. Payment, rate-limiting, and guardrails are
+/// typical implementations.
+interface tool-gate {
+    use types.{plugin-context, plugin-manifest, gate-decision};
+
+    /// Return the plugin's manifest.
+    manifest: func() -> plugin-manifest;
+
+    /// Evaluate a tool call before dispatch.
+    ///
+    /// Parameters:
+    /// - ctx: request context
+    /// - arguments: JSON-encoded tool arguments
+    /// - meta: optional JSON-encoded _meta field
+    /// - config: JSON-encoded plugin configuration
+    ///
+    /// Returns: gate decision (allow/deny/challenge)
+    evaluate-pre-dispatch: func(
+        ctx: plugin-context,
+        arguments: string,
+        meta: option<string>,
+        config: string,
+    ) -> gate-decision;
+
+    /// Evaluate after dispatch (post-execution).
+    ///
+    /// Parameters:
+    /// - ctx: request context
+    /// - arguments: JSON-encoded arguments
+    /// - result: JSON-encoded execution result
+    /// - execution-duration-ms: wall-clock execution time
+    /// - config: JSON-encoded plugin configuration
+    ///
+    /// Returns: gate decision
+    evaluate-post-dispatch: func(
+        ctx: plugin-context,
+        arguments: string,
+        %result: string,
+        execution-duration-ms: u64,
+        config: string,
+    ) -> gate-decision;
+}
+
+/// Transform plugin interface — argument/result rewriting.
+///
+/// Plugins implementing this interface can modify tool arguments before
+/// dispatch and/or modify results after dispatch. PII masking, schema
+/// migration, and field injection are typical uses.
+interface transform {
+    use types.{plugin-context, plugin-manifest, transform-result};
+
+    /// Return the plugin's manifest.
+    manifest: func() -> plugin-manifest;
+
+    /// Transform tool arguments before dispatch.
+    transform-arguments: func(
+        ctx: plugin-context,
+        arguments: string,
+        config: string,
+    ) -> transform-result;
+
+    /// Transform execution result after dispatch.
+    transform-output: func(
+        ctx: plugin-context,
+        %result: string,
+        config: string,
+    ) -> transform-result;
+}
+
+/// Identity plugin interface — resolve identity from request headers.
+///
+/// Plugins implementing this interface extract and verify authentication
+/// tokens from HTTP headers. JWT verification, API key validation, and
+/// mTLS identity extraction are typical implementations.
+interface identity {
+    use types.{plugin-manifest, identity-resolution};
+
+    /// Return the plugin's manifest.
+    manifest: func() -> plugin-manifest;
+
+    /// Resolve identity from request headers.
+    ///
+    /// Parameters:
+    /// - headers: list of (name, value) pairs
+    /// - config: JSON-encoded plugin configuration
+    ///
+    /// Returns: identity resolution (resolved/none/invalid)
+    resolve-identity: func(
+        headers: list<tuple<string, string>>,
+        config: string,
+    ) -> identity-resolution;
+}
+
+/// World that a tool-gate plugin guest implements.
+world tool-gate-plugin {
+    export tool-gate;
+}
+
+/// World that a transform plugin guest implements.
+world transform-plugin {
+    export transform;
+}
+
+/// World that an identity plugin guest implements.
+world identity-plugin {
+    export identity;
+}
