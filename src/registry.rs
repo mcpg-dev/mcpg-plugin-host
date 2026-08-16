@@ -455,7 +455,7 @@ fn classify_transform_result(r: &TransformResult) -> ProbeOutcome {
 
 fn classify_identity_resolution(r: &IdentityResolution) -> ProbeOutcome {
     match r {
-        IdentityResolution::Invalid { reason }
+        IdentityResolution::Invalid { reason, .. }
             if reason.contains(mcpg_plugin_protocol::abi::PANIC_IDENTITY_MSG) =>
         {
             ProbeOutcome::Panicked
@@ -6309,7 +6309,10 @@ impl PluginRegistry {
                     return ChainIdentityOutcome::Resolved(identity);
                 }
                 IdentityResolution::None => continue,
-                IdentityResolution::Invalid { reason } => {
+                IdentityResolution::Invalid {
+                    reason,
+                    response_headers,
+                } => {
                     warn!(
                         plugin_id = %loaded.manifest.id,
                         reason = %reason,
@@ -6318,6 +6321,7 @@ impl PluginRegistry {
                     return ChainIdentityOutcome::Rejected {
                         plugin_id: loaded.manifest.id.clone(),
                         reason,
+                        response_headers,
                     };
                 }
             }
@@ -7176,6 +7180,10 @@ mod tests {
             ) -> IdentityResolution {
                 IdentityResolution::Invalid {
                     reason: "expired token".to_owned(),
+                    response_headers: vec![(
+                        "signature-error".to_owned(),
+                        "error=expired_jwt".to_owned(),
+                    )],
                 }
             }
         }
@@ -7208,9 +7216,18 @@ mod tests {
             )
             .await;
         match result {
-            ChainIdentityOutcome::Rejected { plugin_id, reason } => {
+            ChainIdentityOutcome::Rejected {
+                plugin_id,
+                reason,
+                response_headers,
+            } => {
                 assert_eq!(plugin_id, "id.strict");
                 assert!(reason.contains("expired"), "got: {reason}");
+                // The rejecting plugin's diagnostic headers survive the chain.
+                assert_eq!(
+                    response_headers,
+                    vec![("signature-error".to_owned(), "error=expired_jwt".to_owned())]
+                );
             }
             other => panic!("expected Rejected (chain must stop), got {other:?}"),
         }
@@ -11534,5 +11551,11 @@ pub enum ChainIdentityOutcome {
     /// No plugin recognised a credential in this request.
     NoCredential,
     /// A plugin explicitly rejected the presented credential.
-    Rejected { plugin_id: String, reason: String },
+    Rejected {
+        plugin_id: String,
+        reason: String,
+        /// Headers the transport should attach to the resulting
+        /// authentication-failure response (e.g. `Signature-Error`).
+        response_headers: Vec<(String, String)>,
+    },
 }

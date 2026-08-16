@@ -234,7 +234,12 @@ fn from_wit_identity_resolution(wr: wit_identity::IdentityResolution) -> Identit
             },
         },
         wit_identity::IdentityResolution::None => IdentityResolution::None,
-        wit_identity::IdentityResolution::Invalid(reason) => IdentityResolution::Invalid { reason },
+        // The WASM WIT surface carries only the reason; WASM identity plugins
+        // cannot attach response headers (native cdylibs can).
+        wit_identity::IdentityResolution::Invalid(reason) => IdentityResolution::Invalid {
+            reason,
+            response_headers: Vec::new(),
+        },
     }
 }
 

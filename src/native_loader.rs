@@ -1467,6 +1467,7 @@ impl IdentityProviderPlugin for NativeIdentityProviderAdapter {
                     DispatchFail::TimedOut => format!("native identity '{plugin_id}' timed out"),
                     DispatchFail::Panicked => format!("native identity '{plugin_id}' panicked"),
                 },
+                response_headers: Vec::new(),
             },
         )
         .await
