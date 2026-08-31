@@ -1935,6 +1935,23 @@ impl PluginRegistry {
         self.audit_sinks.iter().any(|p| p.state.serves_traffic())
     }
 
+    /// Whether a tools/call must produce a `mcpg.tool.call.allowed`
+    /// record. Dispatch sites consult this so the gate-evaluation
+    /// path runs even with no tool_gate plugins loaded — the
+    /// empty-chain branch of [`Self::evaluate_tool_gates_pre`] owns
+    /// that emission, and skipping the call would silence tool-call
+    /// audit coverage entirely.
+    pub fn emits_tool_call_allowed(&self) -> bool {
+        self.audit_emit_tool_call_allowed && self.has_serving_audit_sink()
+    }
+
+    /// `mcpg.tool.call.completed` counterpart of
+    /// [`Self::emits_tool_call_allowed`], consulted before the
+    /// post-dispatch chain.
+    pub fn emits_tool_call_completed(&self) -> bool {
+        self.audit_emit_tool_call_completed && self.has_serving_audit_sink()
+    }
+
     /// Emit `event` to every registered sink that is currently
     /// serving traffic. Fan-out is sequential in registration order;
     /// one slow sink blocks the others but bounded-latency is the
@@ -5736,12 +5753,14 @@ impl PluginRegistry {
         ctx: &PluginContext,
         arguments: &serde_json::Value,
         meta: Option<&serde_json::Value>,
+        upstream_request_id: Option<&str>,
     ) -> GateDecision {
         if self.tool_gate_chain.is_empty() {
             // No chain → emit the success event so empty-chain
             // deploys still get tool-call audit coverage.
             if self.audit_emit_tool_call_allowed {
-                let event = crate::audit_events::tool_gate_allowed_event(ctx, 0, &[]);
+                let event = crate::audit_events::tool_gate_allowed_event(ctx, 0, &[])
+                    .with_upstream_request_id(upstream_request_id.map(str::to_owned));
                 let _ = self.emit_audit_event(&event).await;
             }
             return GateDecision::allow();
@@ -5831,7 +5850,8 @@ impl PluginRegistry {
                             true,
                             metadata.as_ref(),
                             None,
-                        );
+                        )
+                        .with_upstream_request_id(upstream_request_id.map(str::to_owned));
                         let _ = self.emit_audit_event(&event).await;
                     }
                     // Collect metadata from allow decisions (e.g. payment receipts)
@@ -5904,7 +5924,8 @@ impl PluginRegistry {
                         action,
                         outcome,
                         decision_details(&decision),
-                    );
+                    )
+                    .with_upstream_request_id(upstream_request_id.map(str::to_owned));
                     let _ = self.emit_audit_event(&event).await;
                     // Record a payment-specific failure
                     // per PCI-DSS 10.2.2. Distinct from the
@@ -5923,7 +5944,8 @@ impl PluginRegistry {
                             false,
                             None,
                             deny_reason,
-                        );
+                        )
+                        .with_upstream_request_id(upstream_request_id.map(str::to_owned));
                         let _ = self.emit_audit_event(&payment_event).await;
                     }
                     return decision;
@@ -5935,7 +5957,8 @@ impl PluginRegistry {
         // (gated on operator config; default ON for compliance
         // posture) and return the merged metadata.
         if self.audit_emit_tool_call_allowed {
-            let event = crate::audit_events::tool_gate_allowed_event(ctx, evaluated, &chain);
+            let event = crate::audit_events::tool_gate_allowed_event(ctx, evaluated, &chain)
+                .with_upstream_request_id(upstream_request_id.map(str::to_owned));
             let _ = self.emit_audit_event(&event).await;
         }
         GateDecision::Allow {
@@ -5956,6 +5979,7 @@ impl PluginRegistry {
         arguments: &serde_json::Value,
         result: &serde_json::Value,
         execution_duration_ms: u64,
+        upstream_request_id: Option<&str>,
     ) -> GateDecision {
         if self.tool_gate_chain.is_empty() {
             if self.audit_emit_tool_call_completed {
@@ -5964,7 +5988,8 @@ impl PluginRegistry {
                     0,
                     execution_duration_ms,
                     &[],
-                );
+                )
+                .with_upstream_request_id(upstream_request_id.map(str::to_owned));
                 let _ = self.emit_audit_event(&event).await;
             }
             return GateDecision::allow();
@@ -6089,7 +6114,8 @@ impl PluginRegistry {
                 evaluated,
                 execution_duration_ms,
                 &chain,
-            );
+            )
+            .with_upstream_request_id(upstream_request_id.map(str::to_owned));
             let _ = self.emit_audit_event(&event).await;
         }
         GateDecision::Allow {
@@ -6808,7 +6834,7 @@ mod tests {
         assert!(!reg.has_tool_gate_plugins());
         assert_eq!(reg.total_count(), 0);
         let decision = reg
-            .evaluate_tool_gates_pre(&test_context(), &serde_json::json!({}), None)
+            .evaluate_tool_gates_pre(&test_context(), &serde_json::json!({}), None, None)
             .await;
         assert!(decision.is_allow());
     }
@@ -6828,7 +6854,7 @@ mod tests {
         assert!(reg.has_tool_gate_plugins());
         assert_eq!(reg.total_count(), 1);
         let decision = reg
-            .evaluate_tool_gates_pre(&test_context(), &serde_json::json!({}), None)
+            .evaluate_tool_gates_pre(&test_context(), &serde_json::json!({}), None, None)
             .await;
         assert!(decision.is_allow());
     }
@@ -6936,7 +6962,7 @@ mod tests {
         .unwrap();
         assert_eq!(reg.total_count(), 2);
         let decision = reg
-            .evaluate_tool_gates_pre(&test_context(), &serde_json::json!({}), None)
+            .evaluate_tool_gates_pre(&test_context(), &serde_json::json!({}), None, None)
             .await;
         assert!(!decision.is_allow());
     }
@@ -7028,6 +7054,7 @@ mod tests {
                 &serde_json::json!({}),
                 &serde_json::json!({"content": []}),
                 100,
+                None,
             )
             .await;
         assert!(decision.is_allow());
@@ -7907,6 +7934,7 @@ mod tests {
             resource: None,
             outcome: mcpg_plugin_protocol::audit::AuditOutcome::Success,
             request_id: None,
+            upstream_request_id: None,
             node_id: None,
             details: serde_json::json!({}),
             prev_event_hash: None,
@@ -7930,6 +7958,62 @@ mod tests {
         assert!(results.iter().all(|r| r.result.is_ok()));
         assert_eq!(sink_a.emitted.lock().await.len(), 1);
         assert_eq!(sink_b.emitted.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn empty_gate_chain_still_emits_tool_call_events_with_upstream_id() {
+        let mut reg = PluginRegistry::new();
+        let sink = audit_sink("dev.test.audit");
+        reg.register_audit_sink(sink.clone(), PluginTier::Native)
+            .unwrap();
+        assert!(reg.emits_tool_call_allowed());
+        assert!(reg.emits_tool_call_completed());
+
+        let pre = reg
+            .evaluate_tool_gates_pre(
+                &test_context(),
+                &serde_json::json!({}),
+                None,
+                Some("caller-req-1"),
+            )
+            .await;
+        assert!(pre.is_allow());
+        let post = reg
+            .evaluate_tool_gates_post(
+                &test_context(),
+                &serde_json::json!({}),
+                &serde_json::json!({"content": []}),
+                7,
+                Some("caller-req-1"),
+            )
+            .await;
+        assert!(matches!(post, GateDecision::Allow { .. }));
+
+        let emitted = sink.emitted.lock().await;
+        let actions: Vec<&str> = emitted.iter().map(|e| e.action.as_str()).collect();
+        assert_eq!(
+            actions,
+            vec!["mcpg.tool.call.allowed", "mcpg.tool.call.completed"]
+        );
+        assert!(
+            emitted
+                .iter()
+                .all(|e| e.upstream_request_id.as_deref() == Some("caller-req-1"))
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_call_audit_accessors_require_flag_and_serving_sink() {
+        let mut reg = PluginRegistry::new();
+        // No sink registered: nothing to emit to.
+        assert!(!reg.emits_tool_call_allowed());
+        assert!(!reg.emits_tool_call_completed());
+        reg.register_audit_sink(audit_sink("dev.test.audit"), PluginTier::Native)
+            .unwrap();
+        assert!(reg.emits_tool_call_allowed());
+        reg.set_tool_call_audit_emission(false, false);
+        assert!(!reg.emits_tool_call_allowed());
+        assert!(!reg.emits_tool_call_completed());
     }
 
     #[test]
@@ -10531,7 +10615,7 @@ mod tests {
         )
         .unwrap();
         let decision = reg
-            .evaluate_tool_gates_pre(&test_context(), &serde_json::json!({}), None)
+            .evaluate_tool_gates_pre(&test_context(), &serde_json::json!({}), None, None)
             .await;
         match decision {
             GateDecision::Allow { metadata, .. } => {
@@ -10564,7 +10648,7 @@ mod tests {
         )
         .unwrap();
         let decision = reg
-            .evaluate_tool_gates_pre(&test_context(), &serde_json::json!({}), None)
+            .evaluate_tool_gates_pre(&test_context(), &serde_json::json!({}), None, None)
             .await;
         match decision {
             GateDecision::Allow { metadata, .. } => {
@@ -10592,7 +10676,7 @@ mod tests {
         )
         .unwrap();
         let decision = reg
-            .evaluate_tool_gates_pre(&test_context(), &serde_json::json!({}), None)
+            .evaluate_tool_gates_pre(&test_context(), &serde_json::json!({}), None, None)
             .await;
         assert!(matches!(decision, GateDecision::Allow { .. }));
     }
@@ -10611,7 +10695,7 @@ mod tests {
         )
         .unwrap();
         let decision = reg
-            .evaluate_tool_gates_pre(&test_context(), &serde_json::json!({}), None)
+            .evaluate_tool_gates_pre(&test_context(), &serde_json::json!({}), None, None)
             .await;
         assert!(matches!(decision, GateDecision::Deny { .. }));
     }
@@ -10669,6 +10753,7 @@ mod tests {
                 &serde_json::json!({}),
                 &serde_json::json!({"content": []}),
                 50,
+                None,
             )
             .await;
         assert!(matches!(decision, GateDecision::Allow { .. }));
@@ -10693,6 +10778,7 @@ mod tests {
                 &serde_json::json!({}),
                 &serde_json::json!({"content": []}),
                 50,
+                None,
             )
             .await;
         assert!(matches!(decision, GateDecision::Deny { .. }));
@@ -10751,7 +10837,7 @@ mod tests {
         )
         .unwrap();
         let decision = reg
-            .evaluate_tool_gates_pre(&test_context(), &serde_json::json!({"orig": 1}), None)
+            .evaluate_tool_gates_pre(&test_context(), &serde_json::json!({"orig": 1}), None, None)
             .await;
         match decision {
             GateDecision::Allow {
@@ -10790,6 +10876,7 @@ mod tests {
                 &serde_json::json!({}),
                 &serde_json::json!({"content": []}),
                 1,
+                None,
             )
             .await;
         match decision {
@@ -11088,21 +11175,21 @@ mod tests {
 
         // With deny first, the chain denies.
         let d = reg
-            .evaluate_tool_gates_pre(&test_context(), &serde_json::json!({}), None)
+            .evaluate_tool_gates_pre(&test_context(), &serde_json::json!({}), None, None)
             .await;
         assert!(matches!(d, GateDecision::Deny { .. }));
 
         // Disable deny → chain sees only allow.
         reg.disable("deny").unwrap();
         let d = reg
-            .evaluate_tool_gates_pre(&test_context(), &serde_json::json!({}), None)
+            .evaluate_tool_gates_pre(&test_context(), &serde_json::json!({}), None, None)
             .await;
         assert!(matches!(d, GateDecision::Allow { .. }));
 
         // Re-enable → chain denies again.
         reg.enable("deny").unwrap();
         let d = reg
-            .evaluate_tool_gates_pre(&test_context(), &serde_json::json!({}), None)
+            .evaluate_tool_gates_pre(&test_context(), &serde_json::json!({}), None, None)
             .await;
         assert!(matches!(d, GateDecision::Deny { .. }));
     }
@@ -11261,7 +11348,7 @@ mod tests {
         let reg_clone = Arc::clone(&reg);
         let inflight_handle = tokio::spawn(async move {
             reg_clone
-                .evaluate_tool_gates_pre(&test_context(), &serde_json::json!({}), None)
+                .evaluate_tool_gates_pre(&test_context(), &serde_json::json!({}), None, None)
                 .await
         });
 
@@ -11290,7 +11377,7 @@ mod tests {
         // A new request during drain should see `serves_traffic() ==
         // false` and skip the plugin — no blocking, no inflight bump.
         let empty = reg
-            .evaluate_tool_gates_pre(&test_context(), &serde_json::json!({}), None)
+            .evaluate_tool_gates_pre(&test_context(), &serde_json::json!({}), None, None)
             .await;
         matches!(empty, GateDecision::Allow { .. });
         assert_eq!(
@@ -11317,7 +11404,7 @@ mod tests {
         let reg_clone = Arc::clone(&reg);
         let _handle = tokio::spawn(async move {
             reg_clone
-                .evaluate_tool_gates_pre(&test_context(), &serde_json::json!({}), None)
+                .evaluate_tool_gates_pre(&test_context(), &serde_json::json!({}), None, None)
                 .await
         });
 

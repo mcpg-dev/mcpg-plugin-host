@@ -402,6 +402,7 @@ mod tests {
             resource: None,
             outcome: AuditOutcome::Success,
             request_id: None,
+            upstream_request_id: None,
             node_id: None,
             details: serde_json::json!({}),
             prev_event_hash: None,

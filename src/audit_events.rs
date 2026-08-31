@@ -64,6 +64,7 @@ pub fn tool_gate_event(
         resource: Some(format!("tool://{}", ctx.tool_name)),
         outcome,
         request_id: Some(ctx.request_id.clone()),
+        upstream_request_id: None,
         node_id: None,
         details: serde_json::json!({
             "plugin_id": plugin_id,
@@ -93,6 +94,7 @@ pub fn tool_gate_allowed_event(
         resource: Some(format!("tool://{}", ctx.tool_name)),
         outcome: AuditOutcome::Success,
         request_id: Some(ctx.request_id.clone()),
+        upstream_request_id: None,
         node_id: None,
         details: serde_json::json!({
             "tool_gate_plugins_evaluated": plugin_count,
@@ -122,6 +124,7 @@ pub fn tool_gate_completed_event(
         resource: Some(format!("tool://{}", ctx.tool_name)),
         outcome: AuditOutcome::Success,
         request_id: Some(ctx.request_id.clone()),
+        upstream_request_id: None,
         node_id: None,
         details: serde_json::json!({
             "tool_gate_plugins_evaluated": plugin_count,
@@ -159,6 +162,7 @@ pub fn tool_call_unknown_event(ctx: &PluginContext) -> AuditEvent {
         resource: Some(format!("tool://{safe_name}")),
         outcome: AuditOutcome::Failure,
         request_id: Some(ctx.request_id.clone()),
+        upstream_request_id: None,
         node_id: None,
         details: serde_json::json!({
             "surface": ctx.surface,
@@ -189,6 +193,7 @@ pub fn tool_call_access_denied_event(ctx: &PluginContext, audit_reason: &str) ->
         resource: Some(format!("tool://{}", ctx.tool_name)),
         outcome: AuditOutcome::Denied,
         request_id: Some(ctx.request_id.clone()),
+        upstream_request_id: None,
         node_id: None,
         details: serde_json::json!({
             "surface": ctx.surface,
@@ -238,6 +243,7 @@ pub fn resource_read_success_event(
         resource: Some(format!("resource://{safe_uri}")),
         outcome: AuditOutcome::Success,
         request_id: Some(ctx.request_id.clone()),
+        upstream_request_id: None,
         node_id: None,
         details: serde_json::json!({
             "surface": ctx.surface,
@@ -264,6 +270,7 @@ pub fn resource_read_denied_event(ctx: &PluginContext, uri: &str, plugin_id: &st
         resource: Some(format!("resource://{safe_uri}")),
         outcome: AuditOutcome::Denied,
         request_id: Some(ctx.request_id.clone()),
+        upstream_request_id: None,
         node_id: None,
         details: serde_json::json!({
             "surface": ctx.surface,
@@ -291,6 +298,7 @@ pub fn resource_read_not_found_event(ctx: &PluginContext, uri: &str) -> AuditEve
         resource: Some(format!("resource://{safe_uri}")),
         outcome: AuditOutcome::Failure,
         request_id: Some(ctx.request_id.clone()),
+        upstream_request_id: None,
         node_id: None,
         details: serde_json::json!({
             "surface": ctx.surface,
@@ -317,6 +325,7 @@ pub fn prompt_get_success_event(ctx: &PluginContext, prompt_name: &str) -> Audit
         resource: Some(format!("prompt://{safe_name}")),
         outcome: AuditOutcome::Success,
         request_id: Some(ctx.request_id.clone()),
+        upstream_request_id: None,
         node_id: None,
         details: serde_json::json!({
             "surface": ctx.surface,
@@ -343,6 +352,7 @@ pub fn prompt_get_denied_event(
         resource: Some(format!("prompt://{safe_name}")),
         outcome: AuditOutcome::Denied,
         request_id: Some(ctx.request_id.clone()),
+        upstream_request_id: None,
         node_id: None,
         details: serde_json::json!({
             "surface": ctx.surface,
@@ -382,6 +392,7 @@ pub fn list_call_event(
         resource: Some(format!("catalog://{kind}")),
         outcome: AuditOutcome::Success,
         request_id: Some(request_id.to_owned()),
+        upstream_request_id: None,
         node_id: None,
         details: serde_json::json!({
             "kind": kind,
@@ -413,6 +424,7 @@ pub fn apps_offered_event(
         resource: Some("catalog://tool".to_owned()),
         outcome: AuditOutcome::Success,
         request_id: Some(request_id.to_owned()),
+        upstream_request_id: None,
         node_id: None,
         details: serde_json::json!({
             "apps": apps,
@@ -440,6 +452,7 @@ pub fn resource_subscribe_event(ctx: &PluginContext, uri: &str) -> AuditEvent {
         resource: Some(format!("resource://{safe_uri}")),
         outcome: AuditOutcome::Success,
         request_id: Some(ctx.request_id.clone()),
+        upstream_request_id: None,
         node_id: None,
         details: serde_json::json!({
             "uri": safe_uri,
@@ -469,6 +482,7 @@ pub fn resource_unsubscribe_event(
         resource: Some(format!("resource://{safe_uri}")),
         outcome: AuditOutcome::Success,
         request_id: Some(ctx.request_id.clone()),
+        upstream_request_id: None,
         node_id: None,
         details: serde_json::json!({
             "uri": safe_uri,
@@ -502,6 +516,7 @@ pub fn elicitation_requested_event(
         resource: Some(format!("elicitation://{step_id}")),
         outcome: AuditOutcome::Success,
         request_id: Some(request_id.to_owned()),
+        upstream_request_id: None,
         node_id: None,
         details: serde_json::json!({
             "session_id": session_id,
@@ -540,6 +555,7 @@ pub fn elicitation_completed_event(
         resource: Some(format!("elicitation://{elicitation_id}")),
         outcome,
         request_id: Some(ctx.request_id.clone()),
+        upstream_request_id: None,
         node_id: None,
         details: serde_json::json!({
             "elicitation_id": elicitation_id,
@@ -573,6 +589,7 @@ pub fn roots_requested_event(
         resource: Some(format!("roots://{step_id}")),
         outcome: AuditOutcome::Success,
         request_id: Some(request_id.to_owned()),
+        upstream_request_id: None,
         node_id: None,
         details: serde_json::json!({
             "session_id": session_id,
@@ -606,6 +623,7 @@ pub fn completion_requested_event(
         resource: Some(format!("completion://{ref_kind}/{ref_name}")),
         outcome: AuditOutcome::Success,
         request_id: Some(ctx.request_id.clone()),
+        upstream_request_id: None,
         node_id: None,
         details: serde_json::json!({
             "ref_kind": ref_kind,
@@ -638,6 +656,7 @@ pub fn operation_cancelled_event(
         resource: Some(format!("request://{cancelled_request_id}")),
         outcome: AuditOutcome::Success,
         request_id: Some(ctx.request_id.clone()),
+        upstream_request_id: None,
         node_id: None,
         details: serde_json::json!({
             "cancelled_request_id": cancelled_request_id,
@@ -673,6 +692,7 @@ pub fn pipeline_started_event(
         resource: Some(format!("pipeline://{profile}")),
         outcome: AuditOutcome::Success,
         request_id: Some(request_id.to_owned()),
+        upstream_request_id: None,
         node_id: None,
         details: serde_json::json!({
             "pipeline_id": pipeline_id,
@@ -716,6 +736,7 @@ pub fn pipeline_completed_event(
         resource: Some(format!("pipeline://{profile}")),
         outcome,
         request_id: Some(request_id.to_owned()),
+        upstream_request_id: None,
         node_id: None,
         details: serde_json::json!({
             "pipeline_id": pipeline_id,
@@ -789,6 +810,7 @@ pub fn payment_outcome_event(
         )),
         outcome,
         request_id: Some(ctx.request_id.clone()),
+        upstream_request_id: None,
         node_id: None,
         details: serde_json::json!({
             "payment_kind": payment_kind,
@@ -845,6 +867,7 @@ pub fn sampling_requested_event(
         resource: Some(format!("sampling://{}", model_hint.unwrap_or("any"))),
         outcome: AuditOutcome::Success,
         request_id: Some(request_id.to_owned()),
+        upstream_request_id: None,
         node_id: None,
         details: serde_json::json!({
             "session_id": session_id,
@@ -897,6 +920,7 @@ pub fn auth_failed_event(
         resource: None,
         outcome: AuditOutcome::Failure,
         request_id: Some(request_id.to_owned()),
+        upstream_request_id: None,
         node_id: None,
         details: serde_json::json!({
             "auth_method": auth_method,
@@ -938,6 +962,7 @@ pub fn session_opened_event(
         resource: Some(format!("session://{session_id}")),
         outcome: AuditOutcome::Success,
         request_id: None,
+        upstream_request_id: None,
         node_id: None,
         details: serde_json::json!({
             "session_id": session_id,
@@ -977,6 +1002,7 @@ pub fn session_terminated_event(
         resource: Some(format!("session://{session_id}")),
         outcome: AuditOutcome::Success,
         request_id: None,
+        upstream_request_id: None,
         node_id: None,
         details: serde_json::json!({
             "session_id": session_id,
@@ -1002,6 +1028,7 @@ pub fn prompt_get_not_found_event(ctx: &PluginContext, prompt_name: &str) -> Aud
         resource: Some(format!("prompt://{safe_name}")),
         outcome: AuditOutcome::Failure,
         request_id: Some(ctx.request_id.clone()),
+        upstream_request_id: None,
         node_id: None,
         details: serde_json::json!({
             "surface": ctx.surface,
@@ -1032,6 +1059,7 @@ pub fn admin_event(
         resource: Some(format!("plugin://{plugin_id}")),
         outcome,
         request_id: None,
+        upstream_request_id: None,
         node_id: None,
         details,
         prev_event_hash: None,
@@ -1055,6 +1083,7 @@ pub fn lifecycle_event(
         resource: None,
         outcome,
         request_id: None,
+        upstream_request_id: None,
         node_id: None,
         details,
         prev_event_hash: None,
@@ -1147,6 +1176,7 @@ pub fn backend_executed_event(
         resource: Some(format!("backend://{kind}/{profile}")),
         outcome,
         request_id: Some(request_id.to_owned()),
+        upstream_request_id: None,
         node_id: None,
         details: serde_json::Value::Object(details),
         prev_event_hash: None,
@@ -1188,6 +1218,7 @@ pub fn transform_applied_event(
         resource: Some(format!("plugin://{plugin_id}")),
         outcome: AuditOutcome::Success,
         request_id: Some(ctx.request_id.clone()),
+        upstream_request_id: None,
         node_id: None,
         details: serde_json::json!({
             "plugin_id": plugin_id,
@@ -1239,6 +1270,7 @@ pub fn catalog_filtered_event(
         resource: Some(format!("catalog://{surface}")),
         outcome: AuditOutcome::Success,
         request_id: Some(request_id.to_owned()),
+        upstream_request_id: None,
         node_id: None,
         details: serde_json::json!({
             "surface": surface,
@@ -1279,6 +1311,7 @@ pub fn watch_fired_event(
         resource: Some(format!("resource://{uri}")),
         outcome: AuditOutcome::Success,
         request_id: None,
+        upstream_request_id: None,
         node_id: None,
         details: serde_json::json!({
             "uri": uri,
@@ -1338,6 +1371,7 @@ pub fn config_loaded_event(sha256: &str, source_paths: &[String]) -> AuditEvent 
         resource: Some("config://gateway".into()),
         outcome: AuditOutcome::Success,
         request_id: None,
+        upstream_request_id: None,
         node_id: None,
         details: serde_json::json!({
             "config_sha256": sha256,
@@ -1371,6 +1405,7 @@ pub fn config_secrets_resolved_event(refs: serde_json::Value) -> AuditEvent {
         resource: Some("config://gateway/secrets".into()),
         outcome: AuditOutcome::Success,
         request_id: None,
+        upstream_request_id: None,
         node_id: None,
         details: serde_json::json!({ "refs": refs }),
         prev_event_hash: None,
@@ -1394,6 +1429,7 @@ pub fn config_feature_flags_active_event(active: serde_json::Value) -> AuditEven
         resource: Some("config://gateway/feature_flags".into()),
         outcome: AuditOutcome::Success,
         request_id: None,
+        upstream_request_id: None,
         node_id: None,
         details: active,
         prev_event_hash: None,
@@ -1436,6 +1472,7 @@ pub fn config_reloaded_event(
         resource: Some("config://gateway".into()),
         outcome,
         request_id: None,
+        upstream_request_id: None,
         node_id: None,
         details: serde_json::json!({
             "source": source,
@@ -1478,6 +1515,7 @@ pub fn quota_exceeded_event(
         resource: Some(format!("tool://{backend_name}")),
         outcome: AuditOutcome::Failure,
         request_id: Some(request_id.to_owned()),
+        upstream_request_id: None,
         node_id: None,
         details: serde_json::json!({
             "policy_id": policy_id,
@@ -1520,6 +1558,7 @@ pub fn credential_issued_event(
         resource: Some(format!("plugin://{plugin_id}")),
         outcome,
         request_id: None,
+        upstream_request_id: None,
         node_id: None,
         details: serde_json::json!({
             "plugin_id": plugin_id,
@@ -1553,6 +1592,7 @@ pub fn credential_resolution_failed_event(
         resource: Some(format!("plugin://{plugin_id}")),
         outcome: AuditOutcome::Failure,
         request_id,
+        upstream_request_id: None,
         node_id: None,
         details: serde_json::json!({
             "plugin_id": plugin_id,
@@ -1595,6 +1635,7 @@ pub fn secret_resolved_event(
         resource: Some(secret_ref.to_owned()),
         outcome,
         request_id: None,
+        upstream_request_id: None,
         node_id: None,
         details: serde_json::json!({
             "scheme": scheme,
@@ -1628,6 +1669,7 @@ pub fn approval_requested_event(
         resource: Some(format!("approval://{approval_id}")),
         outcome: AuditOutcome::Success,
         request_id: Some(request_id.to_owned()),
+        upstream_request_id: None,
         node_id: None,
         details: serde_json::json!({
             "approval_id": approval_id,
@@ -1667,6 +1709,7 @@ pub fn approval_resolved_event(
         resource: Some(format!("approval://{approval_id}")),
         outcome,
         request_id: Some(request_id.to_owned()),
+        upstream_request_id: None,
         node_id: None,
         details: serde_json::json!({
             "approval_id": approval_id,
@@ -1699,6 +1742,7 @@ pub fn approval_expired_event(
         resource: Some(format!("approval://{approval_id}")),
         outcome: AuditOutcome::Failure,
         request_id: Some(request_id.to_owned()),
+        upstream_request_id: None,
         node_id: None,
         details: serde_json::json!({
             "approval_id": approval_id,
@@ -1747,6 +1791,7 @@ pub fn http_route_dispatched_event(
         resource: Some(format!("http_route://{plugin_id}/{entity_name}")),
         outcome,
         request_id: Some(request_id.to_owned()),
+        upstream_request_id: None,
         node_id: None,
         details: serde_json::json!({
             "plugin_id": plugin_id,
@@ -1796,6 +1841,7 @@ pub fn cluster_member_event(
         resource: Some(format!("node://{node_id}")),
         outcome: AuditOutcome::Success,
         request_id: None,
+        upstream_request_id: None,
         node_id: Some(node_id.to_owned()),
         details: serde_json::json!({
             "kind": kind,
@@ -1831,6 +1877,7 @@ pub fn cluster_leader_event(
         resource: Some(format!("leadership://{role}")),
         outcome,
         request_id: None,
+        upstream_request_id: None,
         node_id: None,
         details: serde_json::json!({
             "plugin_id": plugin_id,
@@ -1864,6 +1911,7 @@ pub fn ping_received_event(
         resource: Some("system://ping".into()),
         outcome: AuditOutcome::Success,
         request_id: Some(request_id.to_owned()),
+        upstream_request_id: None,
         node_id: None,
         details: serde_json::json!({
             "session_id": session_id,
@@ -1892,6 +1940,7 @@ pub fn session_initialized_acked_event(
         resource: session_id.map(|s| format!("session://{s}")),
         outcome: AuditOutcome::Success,
         request_id: None,
+        upstream_request_id: None,
         node_id: None,
         details: serde_json::json!({
             "session_id": session_id,
@@ -1924,6 +1973,7 @@ pub fn progress_notified_event(
         resource: Some(format!("request://{progress_token}")),
         outcome: AuditOutcome::Success,
         request_id: None,
+        upstream_request_id: None,
         node_id: None,
         details: serde_json::json!({
             "progress_token": progress_token,
@@ -1949,6 +1999,7 @@ pub fn list_changed_event(kind: &str, session_count: u64) -> AuditEvent {
         resource: Some(format!("catalog://{kind}")),
         outcome: AuditOutcome::Success,
         request_id: None,
+        upstream_request_id: None,
         node_id: None,
         details: serde_json::json!({
             "kind": kind,
@@ -1979,6 +2030,7 @@ pub fn logging_level_set_event(
         resource: session_id.map(|s| format!("session://{s}")),
         outcome: AuditOutcome::Success,
         request_id: Some(request_id.to_owned()),
+        upstream_request_id: None,
         node_id: None,
         details: serde_json::json!({
             "session_id": session_id,

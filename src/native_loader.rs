@@ -34,8 +34,9 @@ use mcpg_cluster_api::{
     PeerEvent, PubSub, PublishedMessage, Subscription as PubSubSubscription,
 };
 use mcpg_plugin_protocol::abi::{
-    AuditSinkVTable, BackendVTable, BytesSinkRef, CacheVTable, ClusterVTable, ConfigProviderVTable,
-    ContentStoreVTable, DispatcherCallbackRef, DispatcherCallbackResult, EventSinkRef,
+    ApprovalNotifierVTable, AuditSinkVTable, BackendVTable, BytesSinkRef, CacheVTable,
+    CatalogProviderVTable, ClusterVTable, ConfigProviderVTable, ContentStoreVTable,
+    CredentialIssuerVTable, DispatcherCallbackRef, DispatcherCallbackResult, EventSinkRef,
     HttpRouteVTable, IdentityProviderVTable, LogSinkVTable, MCPG_PLUGIN_ABI_VERSION,
     MCPG_PLUGIN_REGISTER_SYMBOL, MetricsSinkVTable, PluginRegisterFn, PluginRegistration,
     PolicyEngineVTable, RPluginContext, RPluginHandle, SecretProviderVTable, StoreVTable,
@@ -968,6 +969,30 @@ impl NativeToolGateAdapter {
                 return Err(anyhow!("plugin does not export a ToolGate vtable"));
             }
         };
+        Self::from_vtable(library, vt, config, alias, services)
+    }
+
+    /// The per-ENTITY constructor the registration path uses. A cdylib
+    /// may export several same-class entities, and `first_*` binds every
+    /// adapter to the first one — the second registration then collides
+    /// on the first entity's kind and refuses boot.
+    pub fn new_for_entity(
+        library: Arc<LoadedNativePlugin>,
+        vtable: &ToolGateVTable,
+        config: serde_json::Value,
+        alias: String,
+        services: Arc<dyn crate::host_services::HostServices>,
+    ) -> Result<Self> {
+        Self::from_vtable(library, clone_tool_gate(vtable), config, alias, services)
+    }
+
+    fn from_vtable(
+        library: Arc<LoadedNativePlugin>,
+        vt: ToolGateVTable,
+        config: serde_json::Value,
+        alias: String,
+        services: Arc<dyn crate::host_services::HostServices>,
+    ) -> Result<Self> {
         let cfg = abi_stable::std_types::RString::from(
             serde_json::to_string(&config).unwrap_or_else(|_| "{}".into()),
         );
@@ -1176,6 +1201,30 @@ impl NativeTransformAdapter {
                 return Err(anyhow!("plugin does not export a Transform vtable"));
             }
         };
+        Self::from_vtable(library, vt, config, alias, services)
+    }
+
+    /// The per-ENTITY constructor the registration path uses. A cdylib
+    /// may export several same-class entities, and `first_*` binds every
+    /// adapter to the first one — the second registration then collides
+    /// on the first entity's kind and refuses boot.
+    pub fn new_for_entity(
+        library: Arc<LoadedNativePlugin>,
+        vtable: &TransformVTable,
+        config: serde_json::Value,
+        alias: String,
+        services: Arc<dyn crate::host_services::HostServices>,
+    ) -> Result<Self> {
+        Self::from_vtable(library, clone_transform(vtable), config, alias, services)
+    }
+
+    fn from_vtable(
+        library: Arc<LoadedNativePlugin>,
+        vt: TransformVTable,
+        config: serde_json::Value,
+        alias: String,
+        services: Arc<dyn crate::host_services::HostServices>,
+    ) -> Result<Self> {
         let cfg = abi_stable::std_types::RString::from(
             serde_json::to_string(&config).unwrap_or_else(|_| "{}".into()),
         );
@@ -1359,6 +1408,39 @@ impl NativeIdentityProviderAdapter {
                 return Err(anyhow!("plugin does not export an Identity vtable"));
             }
         };
+        Self::from_vtable(library, vt, config, alias, services, cluster)
+    }
+
+    /// The per-ENTITY constructor the registration path uses. A cdylib
+    /// may export several same-class entities, and `first_*` binds every
+    /// adapter to the first one — the second registration then collides
+    /// on the first entity's kind and refuses boot.
+    pub fn new_for_entity(
+        library: Arc<LoadedNativePlugin>,
+        vtable: &IdentityProviderVTable,
+        config: serde_json::Value,
+        alias: String,
+        services: Arc<dyn crate::host_services::HostServices>,
+        cluster: Option<mcpg_plugin_protocol::abi::ClusterClientRef>,
+    ) -> Result<Self> {
+        Self::from_vtable(
+            library,
+            clone_identity(vtable),
+            config,
+            alias,
+            services,
+            cluster,
+        )
+    }
+
+    fn from_vtable(
+        library: Arc<LoadedNativePlugin>,
+        vt: IdentityProviderVTable,
+        config: serde_json::Value,
+        alias: String,
+        services: Arc<dyn crate::host_services::HostServices>,
+        cluster: Option<mcpg_plugin_protocol::abi::ClusterClientRef>,
+    ) -> Result<Self> {
         let cfg = abi_stable::std_types::RString::from(
             serde_json::to_string(&config).unwrap_or_else(|_| "{}".into()),
         );
@@ -1722,6 +1804,36 @@ impl NativeContentStorePlugin {
             Some(vt) => clone_content_store(vt),
             None => return Err(anyhow!("plugin does not export a ContentStore vtable")),
         };
+        Self::from_vtable(library, vt, config, alias, services)
+    }
+
+    /// The per-ENTITY constructor the registration path uses. A cdylib
+    /// may export several same-class entities, and `first_*` binds every
+    /// adapter to the first one — the second registration then collides
+    /// on the first entity's kind and refuses boot.
+    pub fn new_for_entity(
+        library: Arc<LoadedNativePlugin>,
+        vtable: &ContentStoreVTable,
+        config: serde_json::Value,
+        alias: String,
+        services: Arc<dyn crate::host_services::HostServices>,
+    ) -> Result<Self> {
+        Self::from_vtable(
+            library,
+            clone_content_store(vtable),
+            config,
+            alias,
+            services,
+        )
+    }
+
+    fn from_vtable(
+        library: Arc<LoadedNativePlugin>,
+        vt: ContentStoreVTable,
+        config: serde_json::Value,
+        alias: String,
+        services: Arc<dyn crate::host_services::HostServices>,
+    ) -> Result<Self> {
         let cfg = abi_stable::std_types::RString::from(
             serde_json::to_string(&config).unwrap_or_else(|_| "{}".into()),
         );
@@ -1915,6 +2027,30 @@ impl NativeBackendAdapter {
                 return Err(anyhow!("plugin does not export a Backend vtable"));
             }
         };
+        Self::from_vtable(library, vt, config, alias, services)
+    }
+
+    /// The per-ENTITY constructor the registration path uses. A cdylib
+    /// may export several same-class entities, and `first_*` binds every
+    /// adapter to the first one — the second registration then collides
+    /// on the first entity's kind and refuses boot.
+    pub fn new_for_entity(
+        library: Arc<LoadedNativePlugin>,
+        vtable: &BackendVTable,
+        config: serde_json::Value,
+        alias: String,
+        services: Arc<dyn crate::host_services::HostServices>,
+    ) -> Result<Self> {
+        Self::from_vtable(library, clone_backend(vtable), config, alias, services)
+    }
+
+    fn from_vtable(
+        library: Arc<LoadedNativePlugin>,
+        vt: BackendVTable,
+        config: serde_json::Value,
+        alias: String,
+        services: Arc<dyn crate::host_services::HostServices>,
+    ) -> Result<Self> {
         let cfg = abi_stable::std_types::RString::from(
             serde_json::to_string(&config).unwrap_or_else(|_| "{}".into()),
         );
@@ -3004,6 +3140,36 @@ impl NativeWatchStrategyAdapter {
                 return Err(anyhow!("plugin does not export a WatchStrategy vtable"));
             }
         };
+        Self::from_vtable(library, vt, config, alias, services)
+    }
+
+    /// The per-ENTITY constructor the registration path uses. A cdylib
+    /// may export several same-class entities, and `first_*` binds every
+    /// adapter to the first one — the second registration then collides
+    /// on the first entity's kind and refuses boot.
+    pub fn new_for_entity(
+        library: Arc<LoadedNativePlugin>,
+        vtable: &WatchStrategyVTable,
+        config: serde_json::Value,
+        alias: String,
+        services: Arc<dyn crate::host_services::HostServices>,
+    ) -> Result<Self> {
+        Self::from_vtable(
+            library,
+            clone_watch_strategy(vtable),
+            config,
+            alias,
+            services,
+        )
+    }
+
+    fn from_vtable(
+        library: Arc<LoadedNativePlugin>,
+        vt: WatchStrategyVTable,
+        config: serde_json::Value,
+        alias: String,
+        services: Arc<dyn crate::host_services::HostServices>,
+    ) -> Result<Self> {
         let cfg = abi_stable::std_types::RString::from(
             serde_json::to_string(&config).unwrap_or_else(|_| "{}".into()),
         );
@@ -3245,9 +3411,33 @@ impl NativeHttpRouteAdapter {
         let vt = match library.registration.first_http_route() {
             Some(vt) => clone_http_route(vt),
             None => {
-                return Err(anyhow!("plugin does not export an HttpRoute vtable"));
+                return Err(anyhow!("plugin does not export a HttpRoute vtable"));
             }
         };
+        Self::from_vtable(library, vt, config, alias, services)
+    }
+
+    /// The per-ENTITY constructor the registration path uses. A cdylib
+    /// may export several same-class entities, and `first_*` binds every
+    /// adapter to the first one — the second registration then collides
+    /// on the first entity's kind and refuses boot.
+    pub fn new_for_entity(
+        library: Arc<LoadedNativePlugin>,
+        vtable: &HttpRouteVTable,
+        config: serde_json::Value,
+        alias: String,
+        services: Arc<dyn crate::host_services::HostServices>,
+    ) -> Result<Self> {
+        Self::from_vtable(library, clone_http_route(vtable), config, alias, services)
+    }
+
+    fn from_vtable(
+        library: Arc<LoadedNativePlugin>,
+        vt: HttpRouteVTable,
+        config: serde_json::Value,
+        alias: String,
+        services: Arc<dyn crate::host_services::HostServices>,
+    ) -> Result<Self> {
         let cfg = abi_stable::std_types::RString::from(
             serde_json::to_string(&config).unwrap_or_else(|_| "{}".into()),
         );
@@ -4010,6 +4200,30 @@ impl NativeAuditSinkAdapter {
                 return Err(anyhow!("plugin does not export an AuditSink vtable"));
             }
         };
+        Self::from_vtable(library, vt, config, alias, services)
+    }
+
+    /// The per-ENTITY constructor the registration path uses. A cdylib
+    /// may export several same-class entities, and `first_*` binds every
+    /// adapter to the first one — the second registration then collides
+    /// on the first entity's kind and refuses boot.
+    pub fn new_for_entity(
+        library: Arc<LoadedNativePlugin>,
+        vtable: &AuditSinkVTable,
+        config: serde_json::Value,
+        alias: String,
+        services: Arc<dyn crate::host_services::HostServices>,
+    ) -> Result<Self> {
+        Self::from_vtable(library, clone_audit_sink(vtable), config, alias, services)
+    }
+
+    fn from_vtable(
+        library: Arc<LoadedNativePlugin>,
+        vt: AuditSinkVTable,
+        config: serde_json::Value,
+        alias: String,
+        services: Arc<dyn crate::host_services::HostServices>,
+    ) -> Result<Self> {
         let cfg = abi_stable::std_types::RString::from(
             serde_json::to_string(&config).unwrap_or_else(|_| "{}".into()),
         );
@@ -4119,6 +4333,30 @@ impl NativeLogSinkAdapter {
                 return Err(anyhow!("plugin does not export a LogSink vtable"));
             }
         };
+        Self::from_vtable(library, vt, config, alias, services)
+    }
+
+    /// The per-ENTITY constructor the registration path uses. A cdylib
+    /// may export several same-class entities, and `first_*` binds every
+    /// adapter to the first one — the second registration then collides
+    /// on the first entity's kind and refuses boot.
+    pub fn new_for_entity(
+        library: Arc<LoadedNativePlugin>,
+        vtable: &LogSinkVTable,
+        config: serde_json::Value,
+        alias: String,
+        services: Arc<dyn crate::host_services::HostServices>,
+    ) -> Result<Self> {
+        Self::from_vtable(library, clone_log_sink(vtable), config, alias, services)
+    }
+
+    fn from_vtable(
+        library: Arc<LoadedNativePlugin>,
+        vt: LogSinkVTable,
+        config: serde_json::Value,
+        alias: String,
+        services: Arc<dyn crate::host_services::HostServices>,
+    ) -> Result<Self> {
         let cfg = abi_stable::std_types::RString::from(
             serde_json::to_string(&config).unwrap_or_else(|_| "{}".into()),
         );
@@ -4325,6 +4563,36 @@ impl NativeTelemetrySinkAdapter {
                 return Err(anyhow!("plugin does not export a TelemetrySink vtable"));
             }
         };
+        Self::from_vtable(library, vt, config, alias, services)
+    }
+
+    /// The per-ENTITY constructor the registration path uses. A cdylib
+    /// may export several same-class entities, and `first_*` binds every
+    /// adapter to the first one — the second registration then collides
+    /// on the first entity's kind and refuses boot.
+    pub fn new_for_entity(
+        library: Arc<LoadedNativePlugin>,
+        vtable: &TelemetrySinkVTable,
+        config: serde_json::Value,
+        alias: String,
+        services: Arc<dyn crate::host_services::HostServices>,
+    ) -> Result<Self> {
+        Self::from_vtable(
+            library,
+            clone_telemetry_sink(vtable),
+            config,
+            alias,
+            services,
+        )
+    }
+
+    fn from_vtable(
+        library: Arc<LoadedNativePlugin>,
+        vt: TelemetrySinkVTable,
+        config: serde_json::Value,
+        alias: String,
+        services: Arc<dyn crate::host_services::HostServices>,
+    ) -> Result<Self> {
         let cfg = abi_stable::std_types::RString::from(
             serde_json::to_string(&config).unwrap_or_else(|_| "{}".into()),
         );
@@ -4560,6 +4828,30 @@ impl NativeMetricsSinkAdapter {
                 return Err(anyhow!("plugin does not export a MetricsSink vtable"));
             }
         };
+        Self::from_vtable(library, vt, config, alias, services)
+    }
+
+    /// The per-ENTITY constructor the registration path uses. A cdylib
+    /// may export several same-class entities, and `first_*` binds every
+    /// adapter to the first one — the second registration then collides
+    /// on the first entity's kind and refuses boot.
+    pub fn new_for_entity(
+        library: Arc<LoadedNativePlugin>,
+        vtable: &MetricsSinkVTable,
+        config: serde_json::Value,
+        alias: String,
+        services: Arc<dyn crate::host_services::HostServices>,
+    ) -> Result<Self> {
+        Self::from_vtable(library, clone_metrics_sink(vtable), config, alias, services)
+    }
+
+    fn from_vtable(
+        library: Arc<LoadedNativePlugin>,
+        vt: MetricsSinkVTable,
+        config: serde_json::Value,
+        alias: String,
+        services: Arc<dyn crate::host_services::HostServices>,
+    ) -> Result<Self> {
         let cfg = abi_stable::std_types::RString::from(
             serde_json::to_string(&config).unwrap_or_else(|_| "{}".into()),
         );
@@ -4855,6 +5147,30 @@ impl NativeStoreAdapter {
                 return Err(anyhow!("plugin does not export a Store vtable"));
             }
         };
+        Self::from_vtable(library, vt, config, alias, services)
+    }
+
+    /// The per-ENTITY constructor the registration path uses. A cdylib
+    /// may export several same-class entities, and `first_*` binds every
+    /// adapter to the first one — the second registration then collides
+    /// on the first entity's kind and refuses boot.
+    pub fn new_for_entity(
+        library: Arc<LoadedNativePlugin>,
+        vtable: &StoreVTable,
+        config: serde_json::Value,
+        alias: String,
+        services: Arc<dyn crate::host_services::HostServices>,
+    ) -> Result<Self> {
+        Self::from_vtable(library, clone_store(vtable), config, alias, services)
+    }
+
+    fn from_vtable(
+        library: Arc<LoadedNativePlugin>,
+        vt: StoreVTable,
+        config: serde_json::Value,
+        alias: String,
+        services: Arc<dyn crate::host_services::HostServices>,
+    ) -> Result<Self> {
         let cfg = abi_stable::std_types::RString::from(
             serde_json::to_string(&config).unwrap_or_else(|_| "{}".into()),
         );
@@ -5168,6 +5484,30 @@ impl NativeCacheAdapter {
                 return Err(anyhow!("plugin does not export a Cache vtable"));
             }
         };
+        Self::from_vtable(library, vt, config, alias, services)
+    }
+
+    /// The per-ENTITY constructor the registration path uses. A cdylib
+    /// may export several same-class entities, and `first_*` binds every
+    /// adapter to the first one — the second registration then collides
+    /// on the first entity's kind and refuses boot.
+    pub fn new_for_entity(
+        library: Arc<LoadedNativePlugin>,
+        vtable: &CacheVTable,
+        config: serde_json::Value,
+        alias: String,
+        services: Arc<dyn crate::host_services::HostServices>,
+    ) -> Result<Self> {
+        Self::from_vtable(library, clone_cache(vtable), config, alias, services)
+    }
+
+    fn from_vtable(
+        library: Arc<LoadedNativePlugin>,
+        vt: CacheVTable,
+        config: serde_json::Value,
+        alias: String,
+        services: Arc<dyn crate::host_services::HostServices>,
+    ) -> Result<Self> {
         let cfg = abi_stable::std_types::RString::from(
             serde_json::to_string(&config).unwrap_or_else(|_| "{}".into()),
         );
@@ -5403,6 +5743,36 @@ impl NativeSecretProviderAdapter {
                 return Err(anyhow!("plugin does not export a SecretProvider vtable"));
             }
         };
+        Self::from_vtable(library, vt, config, alias, services)
+    }
+
+    /// The per-ENTITY constructor the registration path uses. A cdylib
+    /// may export several same-class entities, and `first_*` binds every
+    /// adapter to the first one — the second registration then collides
+    /// on the first entity's kind and refuses boot.
+    pub fn new_for_entity(
+        library: Arc<LoadedNativePlugin>,
+        vtable: &SecretProviderVTable,
+        config: serde_json::Value,
+        alias: String,
+        services: Arc<dyn crate::host_services::HostServices>,
+    ) -> Result<Self> {
+        Self::from_vtable(
+            library,
+            clone_secret_provider(vtable),
+            config,
+            alias,
+            services,
+        )
+    }
+
+    fn from_vtable(
+        library: Arc<LoadedNativePlugin>,
+        vt: SecretProviderVTable,
+        config: serde_json::Value,
+        alias: String,
+        services: Arc<dyn crate::host_services::HostServices>,
+    ) -> Result<Self> {
         let cfg = abi_stable::std_types::RString::from(
             serde_json::to_string(&config).unwrap_or_else(|_| "{}".into()),
         );
@@ -5635,6 +6005,36 @@ impl NativeConfigProviderAdapter {
                 return Err(anyhow!("plugin does not export a ConfigProvider vtable"));
             }
         };
+        Self::from_vtable(library, vt, config, alias, services)
+    }
+
+    /// The per-ENTITY constructor the registration path uses. A cdylib
+    /// may export several same-class entities, and `first_*` binds every
+    /// adapter to the first one — the second registration then collides
+    /// on the first entity's kind and refuses boot.
+    pub fn new_for_entity(
+        library: Arc<LoadedNativePlugin>,
+        vtable: &ConfigProviderVTable,
+        config: serde_json::Value,
+        alias: String,
+        services: Arc<dyn crate::host_services::HostServices>,
+    ) -> Result<Self> {
+        Self::from_vtable(
+            library,
+            clone_config_provider(vtable),
+            config,
+            alias,
+            services,
+        )
+    }
+
+    fn from_vtable(
+        library: Arc<LoadedNativePlugin>,
+        vt: ConfigProviderVTable,
+        config: serde_json::Value,
+        alias: String,
+        services: Arc<dyn crate::host_services::HostServices>,
+    ) -> Result<Self> {
         let cfg = abi_stable::std_types::RString::from(
             serde_json::to_string(&config).unwrap_or_else(|_| "{}".into()),
         );
@@ -5889,6 +6289,39 @@ impl NativePolicyEngineAdapter {
                 return Err(anyhow!("plugin does not export a PolicyEngine vtable"));
             }
         };
+        Self::from_vtable(library, vt, config, alias, services, cluster)
+    }
+
+    /// The per-ENTITY constructor the registration path uses. A cdylib
+    /// may export several same-class entities, and `first_*` binds every
+    /// adapter to the first one — the second registration then collides
+    /// on the first entity's kind and refuses boot.
+    pub fn new_for_entity(
+        library: Arc<LoadedNativePlugin>,
+        vtable: &PolicyEngineVTable,
+        config: serde_json::Value,
+        alias: String,
+        services: Arc<dyn crate::host_services::HostServices>,
+        cluster: Option<mcpg_plugin_protocol::abi::ClusterClientRef>,
+    ) -> Result<Self> {
+        Self::from_vtable(
+            library,
+            clone_policy_engine(vtable),
+            config,
+            alias,
+            services,
+            cluster,
+        )
+    }
+
+    fn from_vtable(
+        library: Arc<LoadedNativePlugin>,
+        vt: PolicyEngineVTable,
+        config: serde_json::Value,
+        alias: String,
+        services: Arc<dyn crate::host_services::HostServices>,
+        cluster: Option<mcpg_plugin_protocol::abi::ClusterClientRef>,
+    ) -> Result<Self> {
         let cfg = abi_stable::std_types::RString::from(
             serde_json::to_string(&config).unwrap_or_else(|_| "{}".into()),
         );
@@ -6093,6 +6526,36 @@ impl NativeCredentialIssuerAdapter {
                 return Err(anyhow!("plugin does not export a CredentialIssuer vtable"));
             }
         };
+        Self::from_vtable(library, vt, config, alias, services)
+    }
+
+    /// The per-ENTITY constructor the registration path uses. A cdylib
+    /// may export several same-class entities, and `first_*` binds every
+    /// adapter to the first one — the second registration then collides
+    /// on the first entity's kind and refuses boot.
+    pub fn new_for_entity(
+        library: Arc<LoadedNativePlugin>,
+        vtable: &CredentialIssuerVTable,
+        config: serde_json::Value,
+        alias: String,
+        services: Arc<dyn crate::host_services::HostServices>,
+    ) -> Result<Self> {
+        Self::from_vtable(
+            library,
+            clone_credential_issuer(vtable),
+            config,
+            alias,
+            services,
+        )
+    }
+
+    fn from_vtable(
+        library: Arc<LoadedNativePlugin>,
+        vt: CredentialIssuerVTable,
+        config: serde_json::Value,
+        alias: String,
+        services: Arc<dyn crate::host_services::HostServices>,
+    ) -> Result<Self> {
         let cfg = abi_stable::std_types::RString::from(
             serde_json::to_string(&config).unwrap_or_else(|_| "{}".into()),
         );
@@ -6324,6 +6787,36 @@ impl NativeApprovalNotifierAdapter {
                 return Err(anyhow!("plugin does not export an ApprovalNotifier vtable"));
             }
         };
+        Self::from_vtable(library, vt, config, alias, services)
+    }
+
+    /// The per-ENTITY constructor the registration path uses. A cdylib
+    /// may export several same-class entities, and `first_*` binds every
+    /// adapter to the first one — the second registration then collides
+    /// on the first entity's kind and refuses boot.
+    pub fn new_for_entity(
+        library: Arc<LoadedNativePlugin>,
+        vtable: &ApprovalNotifierVTable,
+        config: serde_json::Value,
+        alias: String,
+        services: Arc<dyn crate::host_services::HostServices>,
+    ) -> Result<Self> {
+        Self::from_vtable(
+            library,
+            clone_approval_notifier(vtable),
+            config,
+            alias,
+            services,
+        )
+    }
+
+    fn from_vtable(
+        library: Arc<LoadedNativePlugin>,
+        vt: ApprovalNotifierVTable,
+        config: serde_json::Value,
+        alias: String,
+        services: Arc<dyn crate::host_services::HostServices>,
+    ) -> Result<Self> {
         let cfg = abi_stable::std_types::RString::from(
             serde_json::to_string(&config).unwrap_or_else(|_| "{}".into()),
         );
@@ -6501,6 +6994,36 @@ impl NativeCatalogProviderAdapter {
                 return Err(anyhow!("plugin does not export a CatalogProvider vtable"));
             }
         };
+        Self::from_vtable(library, vt, config, alias, services)
+    }
+
+    /// The per-ENTITY constructor the registration path uses. A cdylib
+    /// may export several same-class entities, and `first_*` binds every
+    /// adapter to the first one — the second registration then collides
+    /// on the first entity's kind and refuses boot.
+    pub fn new_for_entity(
+        library: Arc<LoadedNativePlugin>,
+        vtable: &CatalogProviderVTable,
+        config: serde_json::Value,
+        alias: String,
+        services: Arc<dyn crate::host_services::HostServices>,
+    ) -> Result<Self> {
+        Self::from_vtable(
+            library,
+            clone_catalog_provider(vtable),
+            config,
+            alias,
+            services,
+        )
+    }
+
+    fn from_vtable(
+        library: Arc<LoadedNativePlugin>,
+        vt: CatalogProviderVTable,
+        config: serde_json::Value,
+        alias: String,
+        services: Arc<dyn crate::host_services::HostServices>,
+    ) -> Result<Self> {
         let cfg = abi_stable::std_types::RString::from(
             serde_json::to_string(&config).unwrap_or_else(|_| "{}".into()),
         );
@@ -7319,6 +7842,30 @@ impl NativeClusterAdapter {
                 return Err(anyhow!("plugin does not export a Cluster vtable"));
             }
         };
+        Self::from_vtable(library, vt, config, alias, services)
+    }
+
+    /// The per-ENTITY constructor the registration path uses. A cdylib
+    /// may export several same-class entities, and `first_*` binds every
+    /// adapter to the first one — the second registration then collides
+    /// on the first entity's kind and refuses boot.
+    pub fn new_for_entity(
+        library: Arc<LoadedNativePlugin>,
+        vtable: &ClusterVTable,
+        config: serde_json::Value,
+        alias: String,
+        services: Arc<dyn crate::host_services::HostServices>,
+    ) -> Result<Self> {
+        Self::from_vtable(library, clone_cluster(vtable), config, alias, services)
+    }
+
+    fn from_vtable(
+        library: Arc<LoadedNativePlugin>,
+        vt: ClusterVTable,
+        config: serde_json::Value,
+        alias: String,
+        services: Arc<dyn crate::host_services::HostServices>,
+    ) -> Result<Self> {
         let cfg = abi_stable::std_types::RString::from(
             serde_json::to_string(&config).unwrap_or_else(|_| "{}".into()),
         );
@@ -8148,6 +8695,30 @@ impl NativeTransportAdapter {
                 return Err(anyhow!("plugin does not export a Transport vtable"));
             }
         };
+        Self::from_vtable(library, vt, config, alias, services)
+    }
+
+    /// The per-ENTITY constructor the registration path uses. A cdylib
+    /// may export several same-class entities, and `first_*` binds every
+    /// adapter to the first one — the second registration then collides
+    /// on the first entity's kind and refuses boot.
+    pub fn new_for_entity(
+        library: Arc<LoadedNativePlugin>,
+        vtable: &TransportVTable,
+        config: serde_json::Value,
+        alias: String,
+        services: Arc<dyn crate::host_services::HostServices>,
+    ) -> Result<Self> {
+        Self::from_vtable(library, clone_transport(vtable), config, alias, services)
+    }
+
+    fn from_vtable(
+        library: Arc<LoadedNativePlugin>,
+        vt: TransportVTable,
+        config: serde_json::Value,
+        alias: String,
+        services: Arc<dyn crate::host_services::HostServices>,
+    ) -> Result<Self> {
         let cfg = abi_stable::std_types::RString::from(
             serde_json::to_string(&config).unwrap_or_else(|_| "{}".into()),
         );
