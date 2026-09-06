@@ -3166,18 +3166,18 @@ mod tests {
 
     #[test]
     fn cluster_leader_event_success() {
-        let ev = cluster_leader_event("dev.mcpg.cluster.consul", "watch.cedar", true, None);
+        let ev = cluster_leader_event("dev.mcpg.cluster.nats", "watch.cedar", true, None);
         assert_eq!(ev.action, "mcpg.cluster.leader_changed");
         assert_eq!(ev.outcome, AuditOutcome::Success);
         assert_eq!(ev.resource.as_deref(), Some("leadership://watch.cedar"));
-        assert_eq!(ev.details["plugin_id"], "dev.mcpg.cluster.consul");
+        assert_eq!(ev.details["plugin_id"], "dev.mcpg.cluster.nats");
         assert_eq!(ev.details["role"], "watch.cedar");
     }
 
     #[test]
     fn cluster_leader_event_failure_carries_error() {
         let ev = cluster_leader_event(
-            "dev.mcpg.cluster.consul",
+            "dev.mcpg.cluster.nats",
             "watch.cedar",
             false,
             Some("lease conflict"),

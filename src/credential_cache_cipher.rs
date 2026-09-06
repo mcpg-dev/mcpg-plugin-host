@@ -37,7 +37,7 @@
 //!
 //! # Why not just rely on transport TLS?
 //!
-//! Operator hygiene varies. NATS-JetStream / Consul / etcd all
+//! Operator hygiene varies. NATS-JetStream / redis both
 //! support TLS but not all operators turn it on (especially in
 //! private-network deploys where the perception is "the network
 //! is the perimeter"). Application-layer encryption is defence

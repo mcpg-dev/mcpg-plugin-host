@@ -33,12 +33,13 @@
 //! That mode warns once and is intended to be turned off once every replica
 //! is keyed.
 //!
-//! ## Out of scope (v1)
-//! The cluster `Watch` primitive is not wrapped — no in-scope capability
-//! consumes coordinator `watch()` values today (the MCP resource-watch
-//! engine uses the protocol-level `WatchEvent`, a different type). If a
-//! Watch-value consumer is added, an `EncryptingWatch` decorator following
-//! this same pattern is the natural extension.
+//! ## Out of scope
+//! `incr` counters are not sealed — the backend must read the stored
+//! digits to add atomically (redis `INCRBY`, CAS loops elsewhere), so
+//! `incr` passes through to the inner store and the counter value is
+//! visible to anyone who can read the coordinator keyspace. Counters
+//! carry integers (token spend, sequence numbers), not secrets; the
+//! key-swap protection the AAD provides does not apply to them.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -225,6 +226,18 @@ impl KeyValueStore for EncryptingKeyValueStore {
     async fn expire(&self, key: &str, ttl: Option<Duration>) -> Result<bool, ClusterError> {
         self.inner.expire(key, ttl).await
     }
+
+    async fn incr(
+        &self,
+        key: &str,
+        delta: i64,
+        ttl: Option<Duration>,
+    ) -> Result<i64, ClusterError> {
+        // Counters stay plaintext: the backend adds to the stored digits
+        // in place (INCRBY / CAS), which sealing would break. See the
+        // module doc's "Out of scope" note.
+        self.inner.incr(key, delta, ttl).await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -405,6 +418,21 @@ mod tests {
         }
         async fn expire(&self, _key: &str, _ttl: Option<Duration>) -> Result<bool, ClusterError> {
             Ok(true)
+        }
+        async fn incr(
+            &self,
+            key: &str,
+            delta: i64,
+            _ttl: Option<Duration>,
+        ) -> Result<i64, ClusterError> {
+            let mut m = self.map.lock().unwrap();
+            let current = match m.get(key) {
+                Some(b) => mcpg_cluster_api::parse_counter(b)?,
+                None => 0,
+            };
+            let next = current + delta;
+            m.insert(key.to_owned(), Bytes::from(next.to_string()));
+            Ok(next)
         }
     }
 

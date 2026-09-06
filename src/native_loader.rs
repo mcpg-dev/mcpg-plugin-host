@@ -7262,6 +7262,7 @@ fn clone_cluster(vt: &ClusterVTable) -> ClusterVTable {
         kv_delete: vt.kv_delete,
         kv_list_prefix: vt.kv_list_prefix,
         kv_expire: vt.kv_expire,
+        kv_incr: vt.kv_incr,
         shutdown: vt.shutdown,
         drop_instance: vt.drop_instance,
     }
@@ -7518,6 +7519,10 @@ struct NativeClusterKv {
         RPluginHandle,
         abi_stable::std_types::RString,
     ) -> abi_stable::std_types::RString,
+    kv_incr: extern "C" fn(
+        RPluginHandle,
+        abi_stable::std_types::RString,
+    ) -> abi_stable::std_types::RString,
     handle: RPluginHandle,
     plugin_id: String,
     /// Keeps the plugin instance (and cdylib) alive for the KV's life.
@@ -7675,6 +7680,21 @@ impl KeyValueStore for NativeClusterKv {
         });
         let raw = self.call_slot(self.kv_expire, "kv_expire", args).await?;
         self.decode::<bool>("kv_expire", &raw)
+    }
+
+    async fn incr(
+        &self,
+        key: &str,
+        delta: i64,
+        ttl: Option<std::time::Duration>,
+    ) -> Result<i64, ClusterError> {
+        let args = serde_json::json!({
+            "key": key,
+            "delta": delta,
+            "ttl_ms": ttl.map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64),
+        });
+        let raw = self.call_slot(self.kv_incr, "kv_incr", args).await?;
+        self.decode::<i64>("kv_incr", &raw)
     }
 }
 
@@ -8202,6 +8222,7 @@ impl ClusterBackend for NativeClusterAdapter {
             kv_delete: self.vtable.kv_delete,
             kv_list_prefix: self.vtable.kv_list_prefix,
             kv_expire: self.vtable.kv_expire,
+            kv_incr: self.vtable.kv_incr,
             handle: self.handle,
             plugin_id: self.manifest.id.clone(),
             _instance: Arc::clone(&self.instance),

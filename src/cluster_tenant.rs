@@ -1,7 +1,7 @@
 //! Optional per-deployment tenant segment on cluster capability
 //! KV keys + bus topics, so a single coordinator namespace can be fenced
 //! per-tenant by broker-native ACLs (NATS subject perms, redis
-//! key-pattern ACLs, consul/etcd path ACLs).
+//! key-pattern ACLs).
 //!
 //! These decorators wrap an `Arc<dyn KeyValueStore>` / `Arc<dyn PubSub>`
 //! and prefix the KEY / TOPIC (not the value) with a stable head:
@@ -102,6 +102,14 @@ impl KeyValueStore for TenantPrefixKeyValueStore {
     }
     async fn expire(&self, key: &str, ttl: Option<Duration>) -> Result<bool, ClusterError> {
         self.inner.expire(&self.full(key), ttl).await
+    }
+    async fn incr(
+        &self,
+        key: &str,
+        delta: i64,
+        ttl: Option<Duration>,
+    ) -> Result<i64, ClusterError> {
+        self.inner.incr(&self.full(key), delta, ttl).await
     }
 }
 
@@ -221,6 +229,21 @@ mod tests {
         }
         async fn expire(&self, _k: &str, _t: Option<Duration>) -> Result<bool, ClusterError> {
             Ok(true)
+        }
+        async fn incr(
+            &self,
+            key: &str,
+            delta: i64,
+            _t: Option<Duration>,
+        ) -> Result<i64, ClusterError> {
+            let mut m = self.map.lock().unwrap();
+            let current = match m.get(key) {
+                Some(b) => mcpg_cluster_api::parse_counter(b)?,
+                None => 0,
+            };
+            let next = current + delta;
+            m.insert(key.to_owned(), Bytes::from(next.to_string()));
+            Ok(next)
         }
     }
 

@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use mcpg_cluster_api::{
     BoxActiveLease, BoxPeerEventStream, BoxPublishedMessageStream, ClusterBackend, ClusterError,
-    ClusterNodeInfo, ClusterPeer, KeyValueStore, Lease, PubSub, Watch,
+    ClusterNodeInfo, ClusterPeer, KeyValueStore, PubSub,
 };
 use mcpg_plugin_protocol::PluginManifest;
 use tracing::Instrument;
@@ -98,25 +98,17 @@ impl ClusterBackend for MeteredClusterBackend {
 
     // Primitive accessors MUST delegate to the wrapped coordinator — the trait
     // defaults return `None`, which would make the metering decorator silently
-    // hide a coordinator's KeyValueStore / PubSub / Lease / Watch from the
-    // gateway (the boot reachability probe then fails closed, or capability
-    // state silently de-clusters to per-replica Memory* primitives). The
-    // inner primitives are already FFI-attributed; metering happens at the
-    // coordinator-op layer (node_info / locks / leases), not per KV/bus op.
+    // hide a coordinator's KeyValueStore / PubSub from the gateway (the boot
+    // reachability probe then fails closed, or capability state silently
+    // de-clusters to per-replica Memory* primitives). The inner primitives
+    // are already FFI-attributed; metering happens at the coordinator-op
+    // layer (node_info / locks / leases), not per KV/bus op.
     fn key_value_store(&self) -> Option<Arc<dyn KeyValueStore>> {
         self.inner.key_value_store()
     }
 
     fn pub_sub(&self) -> Option<Arc<dyn PubSub>> {
         self.inner.pub_sub()
-    }
-
-    fn lease(&self) -> Option<Arc<dyn Lease>> {
-        self.inner.lease()
-    }
-
-    fn watch(&self) -> Option<Arc<dyn Watch>> {
-        self.inner.watch()
     }
 
     async fn node_info(&self) -> ClusterNodeInfo {

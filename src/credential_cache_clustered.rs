@@ -35,10 +35,9 @@
 //! - **NATS-JetStream**: durable + replayable. Recommended for
 //!   strict-consistency deploys. Subscribers that disconnect
 //!   briefly catch up via stream replay.
-//! - **etcd**: durable within retention window. Reconnect-with-
-//!   revision recovers missed events.
-//! - **Consul**: best-effort gossip. Acceptable for low-frequency
-//!   credential issuance + tolerance for occasional missed
+//! - **redis**: best-effort. A subscriber offline during a
+//!   `PUBLISH` misses that event; acceptable for low-frequency
+//!   credential issuance that tolerates occasional missed
 //!   publishes.
 //!
 //! Operators choose by their existing cluster_backend binding.
@@ -49,7 +48,7 @@
 //! Two layers protect them:
 //!
 //! 1. **Transport TLS on the cluster_backend** — operators
-//!    SHOULD configure TLS on NATS-JS / etcd / Consul (same
+//!    SHOULD configure TLS on NATS-JS / redis (same
 //!    hardening required for any pub/sub of sensitive material).
 //! 2. **Application-layer AEAD via [`EventCipher`]** — operators
 //!    MAY supply a 32-byte symmetric key; events get encrypted

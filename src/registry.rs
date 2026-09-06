@@ -960,8 +960,8 @@ struct LoadedPolicyEnginePlugin {
 /// A loaded `cluster_backend` entity (spec §9.13). Singleton.
 ///
 /// `ffi_ref` is populated when the coordinator is a native cdylib
-/// (the only tier that ships coordinators today — Consul, etcd,
-/// NATS JetStream); the host hands a copy of it to consumer
+/// (the only tier that ships coordinators today — redis, NATS
+/// JetStream); the host hands a copy of it to consumer
 /// plugins (identity, policy_engine) so they can opt into
 /// cluster-coordinated state through their `make` slot's v20
 /// `cluster` argument. `None` when the coordinator is, e.g., a
