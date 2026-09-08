@@ -193,6 +193,20 @@ pub struct PluginArtifactConfig {
     pub protocol_version: String,
     pub schema: String,
     pub has_signature: bool,
+    /// ABI the PACKAGING TOOLCHAIN was built against.
+    ///
+    /// Named for what it is rather than what a reader wants: it is not read
+    /// out of the artefact, which would mean loading the very code the number
+    /// exists to gate. It is accurate whenever the plugin and the packer come
+    /// from one tree — which is how every first-party plugin is built — and a
+    /// claim otherwise.
+    ///
+    /// It is here because the ABI is invisible everywhere else: not in the
+    /// `.so`, not in the `plugin.yaml` sidecar, surfacing only as a hard
+    /// refusal at load that names no cause. Recording it in the config blob
+    /// lets a reader see it without pulling the layer.
+    #[serde(default)]
+    pub packaged_with_abi_version: u32,
 }
 
 /// Successful result of [`push`].
@@ -202,6 +216,32 @@ pub struct PushOutcome {
     pub manifest_digest: String,
     /// Pullable URL the registry returned.
     pub manifest_url: String,
+}
+
+/// Build the config blob for a packaged plugin, without pushing it.
+///
+/// Shared by [`push`] and by the packaging CLI so the two publishers cannot
+/// describe the same artefact differently — a divergence that is invisible
+/// until something starts reading the config, because the pull path skips a
+/// config whose media type it does not recognise rather than rejecting it.
+pub fn artifact_config_for(archive_path: &Path) -> Result<PluginArtifactConfig, OciError> {
+    // Unpack only to read the descriptor; the layer body stays the original
+    // zip bytes.
+    let tmp = tempfile::TempDir::new().map_err(|e| OciError::Io {
+        path: std::env::temp_dir(),
+        source: e,
+    })?;
+    let unpacked = Package::unpack_to(archive_path, tmp.path())?;
+    Ok(PluginArtifactConfig {
+        id: unpacked.descriptor.id.clone(),
+        name: unpacked.descriptor.name.clone(),
+        class: unpacked.descriptor.class.to_string(),
+        runtime: unpacked.descriptor.runtime.to_string(),
+        protocol_version: unpacked.descriptor.protocol_version.clone(),
+        schema: unpacked.descriptor.schema.clone(),
+        has_signature: unpacked.signature_path.is_some(),
+        packaged_with_abi_version: mcpg_plugin_protocol::abi::MCPG_PLUGIN_ABI_VERSION,
+    })
 }
 
 /// Push a packaged plugin (`.zip`) to an OCI registry under the
@@ -230,23 +270,9 @@ pub async fn push(
         source: e,
     })?;
 
-    // Unpack just to parse the descriptor for config-blob
-    // metadata. The layer body is the ORIGINAL zip.
-    let tmp = tempfile::TempDir::new().map_err(|e| OciError::Io {
-        path: std::env::temp_dir(),
-        source: e,
-    })?;
-    let unpacked = Package::unpack_to(archive_path, tmp.path())?;
-    let artifact_config = PluginArtifactConfig {
-        id: unpacked.descriptor.id.clone(),
-        name: unpacked.descriptor.name.clone(),
-        class: unpacked.descriptor.class.to_string(),
-        runtime: unpacked.descriptor.runtime.to_string(),
-        protocol_version: unpacked.descriptor.protocol_version.clone(),
-        schema: unpacked.descriptor.schema.clone(),
-        has_signature: unpacked.signature_path.is_some(),
-    };
-    drop(unpacked);
+    // Descriptor metadata for the config blob; the layer body stays the
+    // ORIGINAL zip bytes.
+    let artifact_config = artifact_config_for(archive_path)?;
 
     let config_json = serde_json::to_vec(&artifact_config).map_err(|e| OciError::Io {
         path: archive_path.to_path_buf(),
@@ -536,10 +562,24 @@ mod tests {
             protocol_version: "1.0".into(),
             schema: "mcpg.dev/plugin/v1".into(),
             has_signature: true,
+            packaged_with_abi_version: 1,
         };
         let json = serde_json::to_string(&c).unwrap();
         let back: PluginArtifactConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back.id, c.id);
+        assert_eq!(back.packaged_with_abi_version, 1);
+        // Artefacts published before this field existed carry no value; they
+        // must still deserialise rather than becoming unreadable.
+        let legacy = serde_json::json!({
+            "id": "x", "name": "x", "class": "tool_gate",
+            "runtime": "native-cdylib-v1", "protocol_version": "1.0",
+            "schema": "mcpg.dev/plugin/v1", "has_signature": false
+        });
+        let old: PluginArtifactConfig = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            old.packaged_with_abi_version, 0,
+            "absent reads as 0, not an error"
+        );
         assert_eq!(back.class, c.class);
         assert_eq!(back.runtime, c.runtime);
         assert!(back.has_signature);
