@@ -56,9 +56,9 @@ const TAG_VERSION: &str = "2";
 fn key() -> &'static [u8; 32] {
     static KEY: OnceLock<[u8; 32]> = OnceLock::new();
     KEY.get_or_init(|| {
-        use rand::RngCore;
+        use rand::Rng;
         let mut k = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut k);
+        rand::rng().fill_bytes(&mut k);
         k
     })
 }

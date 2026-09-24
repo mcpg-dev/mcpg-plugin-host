@@ -48,9 +48,9 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
-    aead::{Aead, KeyInit, Payload, generic_array::GenericArray},
+    aead::{Aead, KeyInit, Payload},
 };
-use rand::{RngCore, rngs::OsRng};
+use rand::{TryRng, rngs::SysRng};
 use serde::{Deserialize, Serialize};
 use zeroize::ZeroizeOnDrop;
 
@@ -158,8 +158,8 @@ impl EventCipher {
         if raw.len() != KEY_BYTES {
             return Err(EventCipherError::InvalidKeyLength { got: raw.len() });
         }
-        let key = GenericArray::from_slice(&raw);
-        let cipher = XChaCha20Poly1305::new(key);
+        let cipher = XChaCha20Poly1305::new_from_slice(&raw)
+            .map_err(|_| EventCipherError::InvalidKeyLength { got: raw.len() })?;
         Ok(Self {
             cipher,
             kid: kid_trimmed.to_owned(),
@@ -177,8 +177,11 @@ impl EventCipher {
         if kid_trimmed.is_empty() {
             return Err(EventCipherError::EmptyKid);
         }
-        let key = GenericArray::from_slice(key_bytes);
-        let cipher = XChaCha20Poly1305::new(key);
+        let cipher = XChaCha20Poly1305::new_from_slice(key_bytes).map_err(|_| {
+            EventCipherError::InvalidKeyLength {
+                got: key_bytes.len(),
+            }
+        })?;
         Ok(Self {
             cipher,
             kid: kid_trimmed.to_owned(),
@@ -201,12 +204,14 @@ impl EventCipher {
     /// definitionally `Payload { msg, aad: &[] }`).
     pub fn seal(&self, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, EventCipherError> {
         let mut nonce_bytes = [0u8; NONCE_BYTES];
-        OsRng.fill_bytes(&mut nonce_bytes);
-        let nonce = XNonce::from_slice(&nonce_bytes);
+        SysRng
+            .try_fill_bytes(&mut nonce_bytes)
+            .expect("OS randomness unavailable");
+        let nonce = XNonce::from(nonce_bytes);
         let ciphertext = self
             .cipher
             .encrypt(
-                nonce,
+                &nonce,
                 Payload {
                     msg: plaintext,
                     aad,
@@ -246,18 +251,17 @@ impl EventCipher {
         let nonce_raw = B64URL
             .decode(envelope.n.as_bytes())
             .map_err(|e| DecryptError::InvalidBase64(e.to_string()))?;
-        if nonce_raw.len() != NONCE_BYTES {
-            return Err(DecryptError::InvalidNonceLength {
+        let nonce = XNonce::try_from(nonce_raw.as_slice()).map_err(|_| {
+            DecryptError::InvalidNonceLength {
                 got: nonce_raw.len(),
-            });
-        }
+            }
+        })?;
         let ciphertext = B64URL
             .decode(envelope.c.as_bytes())
             .map_err(|e| DecryptError::InvalidBase64(e.to_string()))?;
-        let nonce = XNonce::from_slice(&nonce_raw);
         self.cipher
             .decrypt(
-                nonce,
+                &nonce,
                 Payload {
                     msg: ciphertext.as_slice(),
                     aad,
