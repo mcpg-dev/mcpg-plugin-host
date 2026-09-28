@@ -25,6 +25,58 @@ pub fn new_event_id() -> String {
     uuid::Uuid::now_v7().to_string()
 }
 
+/// Identity attributes an audit record carries only as a keyed digest of
+/// their value ([`attribute_digest`]): the RFC 9396 authorization details a
+/// gateway-issued token is limited to may hold transaction data (amounts,
+/// accounts), which an audit trail must not keep. The key stops a reader
+/// from recovering a value by digesting the few candidates it may take;
+/// records digested under one key still correlate. Without a key, the
+/// value is replaced by [`REDACTED_ATTRIBUTE`].
+pub const DIGESTED_ACTOR_ATTRIBUTES: [&str; 1] = ["authorization_details"];
+
+/// What a digested attribute becomes when no digest key is set.
+pub const REDACTED_ATTRIBUTE: &str = "redacted";
+
+/// Prefix of a keyed attribute digest.
+const ATTRIBUTE_DIGEST_PREFIX: &str = "keyed-blake3:";
+
+/// The digest an audit record carries for the attribute value `value`:
+/// `keyed-blake3:` and the hex keyed BLAKE3 of `value` under `key`.
+#[must_use]
+pub fn attribute_digest(key: &[u8; 32], value: &str) -> String {
+    format!(
+        "{ATTRIBUTE_DIGEST_PREFIX}{}",
+        blake3::keyed_hash(key, value.as_bytes()).to_hex()
+    )
+}
+
+/// `event` with every actor attribute named in
+/// [`DIGESTED_ACTOR_ATTRIBUTES`] replaced by its [`attribute_digest`] under
+/// `key`, or by [`REDACTED_ATTRIBUTE`] without one; `None` when its actor
+/// carries none of them.
+#[must_use]
+pub fn with_digested_actor_attributes(
+    event: &AuditEvent,
+    key: Option<&[u8; 32]>,
+) -> Option<AuditEvent> {
+    if !DIGESTED_ACTOR_ATTRIBUTES
+        .iter()
+        .any(|name| event.actor.attributes.contains_key(*name))
+    {
+        return None;
+    }
+    let mut digested = event.clone();
+    for name in DIGESTED_ACTOR_ATTRIBUTES {
+        if let Some(value) = digested.actor.attributes.get_mut(name) {
+            *value = match key {
+                Some(key) => attribute_digest(key, value),
+                None => REDACTED_ATTRIBUTE.to_owned(),
+            };
+        }
+    }
+    Some(digested)
+}
+
 /// Build a `system`-actor identity for lifecycle events (gateway
 /// boot, plugin load/unload, admin actions). Distinct from
 /// `anonymous` so consumers can tell apart "no caller identity"
@@ -2071,6 +2123,56 @@ mod tests {
         assert_eq!(id.kind, "system");
         assert_eq!(id.trust_level, "system");
         assert_eq!(id.subject_id.as_deref(), Some("mcpg-gateway"));
+    }
+
+    #[test]
+    fn digested_actor_attributes_keep_only_a_digest_of_their_value() {
+        let details = r#"[{"type":"payment_initiation","creditorAccount":"DE0012345678"}]"#;
+        let mut event = tool_call_unknown_event(&PluginContext {
+            request_id: "req-7".into(),
+            session_id: None,
+            tool_name: "payments.charge".into(),
+            surface: "tool".into(),
+            identity: PluginIdentity {
+                attributes: std::collections::BTreeMap::from([
+                    ("authorization_details".to_owned(), details.to_owned()),
+                    (
+                        "authorization_details_types".to_owned(),
+                        "payment_initiation".to_owned(),
+                    ),
+                ]),
+                ..system_identity()
+            },
+            transport: "http".into(),
+        });
+        let key = [7u8; 32];
+        let digested =
+            with_digested_actor_attributes(&event, Some(&key)).expect("an attribute to digest");
+        let digest = &digested.actor.attributes["authorization_details"];
+        assert_eq!(*digest, attribute_digest(&key, details));
+        assert!(digest.starts_with("keyed-blake3:"), "{digest}");
+        assert_eq!(digest.len(), "keyed-blake3:".len() + 64);
+        assert_eq!(
+            digested.actor.attributes["authorization_details_types"],
+            "payment_initiation"
+        );
+        let recorded = serde_json::to_string(&digested).expect("serializes");
+        assert!(!recorded.contains("DE0012345678"), "{recorded}");
+
+        // The digest depends on the key: a reader without it cannot test
+        // candidate values against the record.
+        use sha2::Digest as _;
+        assert_ne!(*digest, attribute_digest(&[8u8; 32], details));
+        assert!(!digest.contains(&hex::encode(sha2::Sha256::digest(details))));
+
+        let redacted = with_digested_actor_attributes(&event, None).expect("an attribute");
+        assert_eq!(
+            redacted.actor.attributes["authorization_details"],
+            REDACTED_ATTRIBUTE
+        );
+
+        event.actor.attributes.remove("authorization_details");
+        assert!(with_digested_actor_attributes(&event, Some(&key)).is_none());
     }
 
     #[test]

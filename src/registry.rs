@@ -131,6 +131,13 @@ pub const RESERVED_OVERRIDE_PATH_PREFIXES: &[&str] = &[
     "/plugins/",
     "/webhooks/",
     "/.well-known/",
+    "/oauth/token/",
+    "/oauth/jwks/",
+    "/oauth/revoke/",
+    "/oauth/authorize/",
+    "/oauth/consent/",
+    "/oauth/callback/",
+    "/oauth/connect/",
 ];
 
 /// Whether `path` hits the reserved override set. Equality for the
@@ -638,6 +645,10 @@ pub struct PluginRegistry {
     /// the set ⇒ refused (fail-closed); mirrors the [`Self::granted_caps`]
     /// discipline.
     resource_resolve_allowlist: HashMap<String, std::collections::HashSet<String>>,
+    /// The key audit records digest the actor's
+    /// [`crate::audit_events::DIGESTED_ACTOR_ATTRIBUTES`] under. Set after
+    /// the registry is shared, and again when the configuration reloads.
+    audit_digest_key: std::sync::RwLock<Option<zeroize::Zeroizing<[u8; 32]>>>,
 }
 
 /// A loaded `credential_issuer` entity.
@@ -1148,6 +1159,18 @@ impl PluginRegistry {
             cred_resolve_allowlist: HashMap::new(),
             cred_resolve_ref_allowlist: HashMap::new(),
             resource_resolve_allowlist: HashMap::new(),
+            audit_digest_key: std::sync::RwLock::new(None),
+        }
+    }
+
+    /// Set the key audit records digest the actor's
+    /// [`crate::audit_events::DIGESTED_ACTOR_ATTRIBUTES`] under; without
+    /// one, those attributes are recorded as
+    /// [`crate::audit_events::REDACTED_ATTRIBUTE`].
+    pub fn set_audit_digest_key(&self, key: Option<zeroize::Zeroizing<[u8; 32]>>) {
+        match self.audit_digest_key.write() {
+            Ok(mut slot) => *slot = key,
+            Err(poisoned) => *poisoned.into_inner() = key,
         }
     }
 
@@ -1967,10 +1990,22 @@ impl PluginRegistry {
     /// success, `mcpg_audit_sink_failures_total{sink_id, kind}` on
     /// failure, plus `mcpg_audit_sink_latency_seconds{sink_id}`
     /// sampled for every attempt.
+    ///
+    /// Sinks receive the actor's
+    /// [`crate::audit_events::DIGESTED_ACTOR_ATTRIBUTES`] as digests under
+    /// the key [`Self::set_audit_digest_key`] set, or redacted.
     pub async fn emit_audit_event(
         &self,
         event: &mcpg_plugin_protocol::audit::AuditEvent,
     ) -> Vec<AuditEmitResult> {
+        let digested = {
+            let key = self
+                .audit_digest_key
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            crate::audit_events::with_digested_actor_attributes(event, key.as_deref())
+        };
+        let event = digested.as_ref().unwrap_or(event);
         let mut out = Vec::with_capacity(self.audit_sinks.len());
         for sink in &self.audit_sinks {
             if !sink.state.serves_traffic() {
@@ -7843,6 +7878,23 @@ mod tests {
         assert!(is_reserved_override_path("/plugins/foo"));
         assert!(is_reserved_override_path("/healthz"));
         assert!(is_reserved_override_path("/webhooks/resource-updated/tok"));
+        assert!(is_reserved_override_path("/oauth/token"));
+        assert!(is_reserved_override_path("/oauth/token/extra"));
+        assert!(is_reserved_override_path("/oauth/jwks"));
+        for page in [
+            "/oauth/authorize",
+            "/oauth/consent",
+            "/oauth/callback",
+            "/oauth/connect",
+            "/oauth/revoke",
+        ] {
+            assert!(is_reserved_override_path(page), "{page}");
+        }
+        assert!(!is_reserved_override_path("/oauth/revoked"));
+        assert!(!is_reserved_override_path("/oauth/tokeninfo"));
+        assert!(!is_reserved_override_path("/oauth/token-exchange"));
+        assert!(!is_reserved_override_path("/oauth/jwks.json"));
+        assert!(!is_reserved_override_path("/oauth/callbacks"));
         assert!(!is_reserved_override_path("/hooks/stripe"));
         assert!(!is_reserved_override_path("/admin/custom"));
     }
@@ -7958,6 +8010,45 @@ mod tests {
         assert!(results.iter().all(|r| r.result.is_ok()));
         assert_eq!(sink_a.emitted.lock().await.len(), 1);
         assert_eq!(sink_b.emitted.lock().await.len(), 1);
+    }
+
+    /// Sinks receive an actor's authorization details redacted until a
+    /// digest key is set, then as their keyed digest, never as they are.
+    #[tokio::test]
+    async fn sinks_receive_digested_actor_attributes_under_the_key() {
+        const DETAILS: &str = r#"[{"type":"payment_initiation","amount":"12"}]"#;
+        let mut reg = PluginRegistry::new();
+        let sink = audit_sink("dev.test.audit");
+        reg.register_audit_sink(sink.clone(), PluginTier::Native)
+            .unwrap();
+        let mut event = audit_event();
+        event
+            .actor
+            .attributes
+            .insert("authorization_details".into(), DETAILS.into());
+
+        reg.emit_audit_event(&event).await;
+        let key = zeroize::Zeroizing::new([3u8; 32]);
+        reg.set_audit_digest_key(Some(key.clone()));
+        reg.emit_audit_event(&event).await;
+        reg.set_audit_digest_key(None);
+        reg.emit_audit_event(&event).await;
+
+        let recorded: Vec<String> = sink
+            .emitted
+            .lock()
+            .await
+            .iter()
+            .map(|e| e.actor.attributes["authorization_details"].clone())
+            .collect();
+        assert_eq!(
+            recorded,
+            [
+                crate::audit_events::REDACTED_ATTRIBUTE.to_owned(),
+                crate::audit_events::attribute_digest(&key, DETAILS),
+                crate::audit_events::REDACTED_ATTRIBUTE.to_owned(),
+            ]
+        );
     }
 
     #[tokio::test]
