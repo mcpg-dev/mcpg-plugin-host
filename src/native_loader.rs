@@ -1618,6 +1618,7 @@ fn clone_watch_strategy(vt: &WatchStrategyVTable) -> WatchStrategyVTable {
         kind: vt.kind,
         watch: vt.watch,
         cancel: vt.cancel,
+        acknowledge: vt.acknowledge,
         shutdown: vt.shutdown,
         drop_instance: vt.drop_instance,
     }
@@ -2803,10 +2804,19 @@ impl BackendPlugin for NativeBackendAdapter {
 // WatchStrategy adapter
 // ---------------------------------------------------------------------------
 
+/// Events one watch may have waiting for its sink; more are dropped and
+/// counted.
+pub const WATCH_SINK_QUEUE: usize = 1_024;
+/// Largest watch event a plugin may deliver, checked before decoding.
+pub const WATCH_EVENT_MAX_BYTES: usize = 262_144;
+
 /// Bundle stored on the heap + handed to a native watch plugin.
-/// Keeps the sink + a tokio runtime handle alive for the lifetime of
-/// the watch so the C callback can `block_on` `sink.emit(event)` on
-/// whatever thread the plugin's watch loop uses.
+///
+/// The callback runs on whatever thread the plugin's watch loop uses. It
+/// queues each event on one bounded channel per watch, which a single
+/// task drains into the sink, so events reach the sink in the order the
+/// plugin emitted them and a plugin that emits faster than the sink
+/// consumes loses events (counted) instead of growing memory.
 ///
 /// `cancelled` is set to `true` by
 /// [`NativeWatchHandle::cancel`] **before** the plugin's cancel slot
@@ -2815,10 +2825,38 @@ impl BackendPlugin for NativeBackendAdapter {
 /// Spec compliance is the plugin's responsibility (no callbacks
 /// after `cancel`); the AtomicBool is defense-in-depth.
 struct SinkBridge {
-    sink: Arc<dyn WatchEventSink>,
-    rt: tokio::runtime::Handle,
+    queue: tokio::sync::mpsc::Sender<WatchEvent>,
     cancelled: std::sync::atomic::AtomicBool,
     plugin_alias: String,
+    /// Drop an item that does not decode, rather than emit an empty event.
+    strict: bool,
+}
+
+impl SinkBridge {
+    /// A bridge to `sink`, with the task that feeds it.
+    fn new(sink: Arc<dyn WatchEventSink>, plugin_alias: String, strict: bool) -> Self {
+        let (queue, mut events) = tokio::sync::mpsc::channel::<WatchEvent>(WATCH_SINK_QUEUE);
+        tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                sink.emit(event).await;
+            }
+        });
+        Self {
+            queue,
+            cancelled: std::sync::atomic::AtomicBool::new(false),
+            plugin_alias,
+            strict,
+        }
+    }
+
+    fn dropped(&self, reason: &'static str) {
+        metrics::counter!(
+            "mcpg_plugin_watch_events_dropped_total",
+            "plugin_alias" => self.plugin_alias.clone(),
+            "reason" => reason,
+        )
+        .increment(1);
+    }
 }
 
 extern "C" fn sink_bridge_callback(ctx: usize, event_json: abi_stable::std_types::RString) {
@@ -2839,14 +2877,29 @@ extern "C" fn sink_bridge_callback(ctx: usize, event_json: abi_stable::std_types
         .increment(1);
         return;
     }
-    let event: WatchEvent = serde_json::from_str(event_json.as_str()).unwrap_or_default();
-    // Plugins run their watch loop on their own threads; we need a
-    // tokio runtime to drive emit(). The bridge carries the host's
-    // runtime Handle captured at `watch()` time.
-    let sink = Arc::clone(&bridge.sink);
-    bridge.rt.spawn(async move {
-        sink.emit(event).await;
-    });
+    // A resource watch needs only the change signal, so an item it cannot
+    // read still is one.
+    let event: WatchEvent = if event_json.len() > WATCH_EVENT_MAX_BYTES {
+        if bridge.strict {
+            bridge.dropped("too_large");
+            return;
+        }
+        WatchEvent::default()
+    } else {
+        match serde_json::from_str(event_json.as_str()) {
+            Ok(event) => event,
+            Err(_) if bridge.strict => {
+                bridge.dropped("malformed");
+                return;
+            }
+            Err(_) => WatchEvent::default(),
+        }
+    };
+    match bridge.queue.try_send(event) {
+        Ok(()) => {}
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => bridge.dropped("overflow"),
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3112,6 +3165,42 @@ impl futures_core::Stream for BackendChunkWireStream {
     }
 }
 
+/// The `watch_strategies` entry of `kind` in the descriptor compiled into
+/// `library`. A descriptor that does not parse, or whose entries contradict
+/// each other, refuses the load; one that declares strategies but not this
+/// one is reported, since the declared kinds name what the plugin should
+/// register.
+fn watch_strategy_entry(
+    library: &LoadedNativePlugin,
+    kind: &str,
+) -> Result<Option<mcpg_plugin_protocol::WatchStrategyDescriptor>> {
+    let yaml = library.registration.descriptor_yaml.as_str();
+    if yaml.is_empty() {
+        return Ok(None);
+    }
+    let descriptor = serde_yaml::from_str::<mcpg_plugin_protocol::PluginDescriptor>(yaml)
+        .map_err(|e| anyhow!("the plugin's compiled-in descriptor does not parse: {e}"))?;
+    descriptor
+        .validate_watch_strategies()
+        .map_err(|e| anyhow!("the plugin's compiled-in descriptor: {e}"))?;
+    let entry = descriptor.watch_strategy(kind).cloned();
+    if entry.is_none() && !descriptor.watch_strategies.is_empty() {
+        let declared: Vec<&str> = descriptor
+            .watch_strategies
+            .iter()
+            .map(|s| s.kind.as_str())
+            .collect();
+        tracing::warn!(
+            plugin = %descriptor.id,
+            kind,
+            declared = %declared.join(", "),
+            "the plugin registers a watch strategy its descriptor does not declare; it serves \
+             resource watches and payload-free event sources only"
+        );
+    }
+    Ok(entry)
+}
+
 /// Adapter over a loaded cdylib's [`WatchStrategyVTable`].
 pub struct NativeWatchStrategyAdapter {
     library: Arc<LoadedNativePlugin>,
@@ -3119,6 +3208,7 @@ pub struct NativeWatchStrategyAdapter {
     handle: RPluginHandle,
     manifest: PluginManifest,
     kind: String,
+    event_source: Option<mcpg_plugin_protocol::WatchStrategyDescriptor>,
     #[allow(dead_code)]
     alias: String,
     _host_bridge: crate::host_bridge::HostBridge,
@@ -3200,12 +3290,23 @@ impl NativeWatchStrategyAdapter {
             guard_ffi_drop(|| (vt.drop_instance)(handle));
             return Err(anyhow!("native watch plugin returned empty kind()"));
         }
+        // Read from the descriptor compiled into the cdylib, never from a
+        // sidecar: a strategy its descriptor does not declare is never
+        // bound as a payload-bearing source.
+        let event_source = match watch_strategy_entry(&library, &kind) {
+            Ok(entry) => entry,
+            Err(error) => {
+                guard_ffi_drop(|| (vt.drop_instance)(handle));
+                return Err(error);
+            }
+        };
         Ok(Self {
             library,
             vtable: vt,
             handle,
             manifest,
             kind,
+            event_source,
             alias,
             _host_bridge: host_bridge,
         })
@@ -3260,6 +3361,26 @@ impl WatchHandle for NativeWatchHandle {
         // MUST not emit further events (contract), so leaving the
         // box alive through Drop is fine.
     }
+
+    async fn acknowledge(&self, position: &serde_json::Value) {
+        // A cancelled watch has given up its handle; the plugin must not be
+        // asked about it again.
+        if self
+            .sink_bridge
+            .as_ref()
+            .is_some_and(|bridge| bridge.cancelled.load(std::sync::atomic::Ordering::Acquire))
+        {
+            return;
+        }
+        let Ok(json) = serde_json::to_string(position) else {
+            return;
+        };
+        (self.vtable.acknowledge)(
+            self.plugin_handle,
+            self.watch_handle,
+            abi_stable::std_types::RString::from(json),
+        );
+    }
 }
 
 impl Drop for NativeWatchHandle {
@@ -3280,18 +3401,25 @@ impl WatchStrategyPlugin for NativeWatchStrategyAdapter {
         &self.kind
     }
 
+    fn event_source(&self) -> Option<mcpg_plugin_protocol::WatchStrategyDescriptor> {
+        self.event_source.clone()
+    }
+
     async fn watch(
         &self,
         resource_uri: &str,
         spec: &serde_json::Value,
         sink: Arc<dyn WatchEventSink>,
     ) -> Result<Box<dyn WatchHandle>, WatchError> {
-        let bridge = Box::new(SinkBridge {
-            sink,
-            rt: tokio::runtime::Handle::current(),
-            cancelled: std::sync::atomic::AtomicBool::new(false),
-            plugin_alias: self.manifest.id.clone(),
-        });
+        // An event source of a strategy that declares event types decodes
+        // strictly: a malformed or oversized item is dropped and counted,
+        // never read as an empty event.
+        let strict = self
+            .event_source
+            .as_ref()
+            .is_some_and(|source| !source.event_types.is_empty())
+            && mcpg_plugin_protocol::is_event_source(resource_uri);
+        let bridge = Box::new(SinkBridge::new(sink, self.manifest.id.clone(), strict));
         let ctx = &*bridge as *const SinkBridge as usize;
         let sink_ref = EventSinkRef {
             ctx,
@@ -7525,6 +7653,9 @@ struct NativeClusterKv {
     ) -> abi_stable::std_types::RString,
     handle: RPluginHandle,
     plugin_id: String,
+    /// The coordinator store of its own every call names, when not the
+    /// shared one.
+    store: Option<String>,
     /// Keeps the plugin instance (and cdylib) alive for the KV's life.
     _instance: Arc<NativeClusterInstance>,
 }
@@ -7551,8 +7682,11 @@ impl NativeClusterKv {
             abi_stable::std_types::RString,
         ) -> abi_stable::std_types::RString,
         slot: &'static str,
-        args: serde_json::Value,
+        mut args: serde_json::Value,
     ) -> Result<String, ClusterError> {
+        if let (Some(store), serde_json::Value::Object(map)) = (&self.store, &mut args) {
+            map.insert("store".to_owned(), serde_json::Value::String(store.clone()));
+        }
         let args_str = serde_json::to_string(&args).unwrap_or_else(|_| "{}".into());
         let call =
             crate::ffi_metering::FfiCall::begin(&self.plugin_id, "cluster", slot, args_str.len());
@@ -7755,6 +7889,38 @@ impl NativeClusterAdapter {
             handle: self.handle as usize,
             vtable: self.vtable,
         }
+    }
+
+    /// The FFI-backed KV, on the store named `store` or the shared one.
+    /// Exposed only for coordinators that actually back the `KeyValueStore`
+    /// primitive. The manifest `kv` role is necessary but not sufficient: a
+    /// coordinator may advertise the `kv` slot for routing yet ship no
+    /// `KeyValueStore` impl (its default macro slots return an `Unsupported`
+    /// envelope). Probing the `kv_get` slot once distinguishes the two, so a
+    /// non-KV coordinator keeps the documented per-capability `store:`
+    /// override / MemoryKv fallback rather than surfacing a KV that errors
+    /// on every call.
+    fn ffi_kv(&self, store: Option<&str>) -> Option<Arc<dyn KeyValueStore>> {
+        if !self.manifest.provides.iter().any(|r| r == "kv") {
+            return None;
+        }
+        if !self.probe_kv_supported() {
+            return None;
+        }
+        Some(Arc::new(NativeClusterKv {
+            library: Arc::clone(&self.library),
+            kv_get: self.vtable.kv_get,
+            kv_put: self.vtable.kv_put,
+            kv_put_if_absent: self.vtable.kv_put_if_absent,
+            kv_delete: self.vtable.kv_delete,
+            kv_list_prefix: self.vtable.kv_list_prefix,
+            kv_expire: self.vtable.kv_expire,
+            kv_incr: self.vtable.kv_incr,
+            handle: self.handle,
+            plugin_id: self.manifest.id.clone(),
+            store: store.map(str::to_owned),
+            _instance: Arc::clone(&self.instance),
+        }) as Arc<dyn KeyValueStore>)
     }
 
     /// One-shot synchronous probe: does this coordinator genuinely back the
@@ -8200,33 +8366,11 @@ impl ClusterBackend for NativeClusterAdapter {
     }
 
     fn key_value_store(&self) -> Option<Arc<dyn KeyValueStore>> {
-        // Expose the FFI-backed KV only for coordinators that actually back
-        // the `KeyValueStore` primitive. The manifest `kv` role is necessary
-        // but not sufficient: a coordinator may advertise the `kv` slot for
-        // routing yet ship no `KeyValueStore` impl (its default macro slots
-        // return an `Unsupported` envelope). Probing the `kv_get` slot once
-        // distinguishes the two, so a non-KV coordinator keeps the documented
-        // per-capability `store:` override / MemoryKv fallback rather than
-        // surfacing a KV that errors on every call.
-        if !self.manifest.provides.iter().any(|r| r == "kv") {
-            return None;
-        }
-        if !self.probe_kv_supported() {
-            return None;
-        }
-        Some(Arc::new(NativeClusterKv {
-            library: Arc::clone(&self.library),
-            kv_get: self.vtable.kv_get,
-            kv_put: self.vtable.kv_put,
-            kv_put_if_absent: self.vtable.kv_put_if_absent,
-            kv_delete: self.vtable.kv_delete,
-            kv_list_prefix: self.vtable.kv_list_prefix,
-            kv_expire: self.vtable.kv_expire,
-            kv_incr: self.vtable.kv_incr,
-            handle: self.handle,
-            plugin_id: self.manifest.id.clone(),
-            _instance: Arc::clone(&self.instance),
-        }) as Arc<dyn KeyValueStore>)
+        self.ffi_kv(None)
+    }
+
+    fn key_value_store_named(&self, name: &str) -> Option<Arc<dyn KeyValueStore>> {
+        self.ffi_kv(Some(name))
     }
 
     fn pub_sub(&self) -> Option<Arc<dyn PubSub>> {
@@ -9159,6 +9303,138 @@ mod tests {
             "hash must be stable across reads of an unchanged file"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod watch_sink_bridge_tests {
+    use super::*;
+    use abi_stable::std_types::RString;
+
+    struct Recording {
+        seen: std::sync::Mutex<Vec<Option<String>>>,
+        gate: tokio::sync::Semaphore,
+    }
+
+    #[async_trait]
+    impl WatchEventSink for Recording {
+        async fn emit(&self, event: WatchEvent) {
+            self.gate.acquire().await.expect("open").forget();
+            self.seen.lock().unwrap().push(event.user_id);
+        }
+    }
+
+    fn event(user: usize) -> RString {
+        RString::from(serde_json::json!({ "user_id": user.to_string() }).to_string())
+    }
+
+    #[tokio::test]
+    async fn events_reach_the_sink_in_emit_order_and_overflow_is_dropped() {
+        let sink = Arc::new(Recording {
+            seen: std::sync::Mutex::new(Vec::new()),
+            gate: tokio::sync::Semaphore::new(0),
+        });
+        let bridge = Box::new(SinkBridge::new(
+            Arc::clone(&sink) as Arc<dyn WatchEventSink>,
+            "test.watch".to_owned(),
+            false,
+        ));
+        let ctx = &*bridge as *const SinkBridge as usize;
+        // The sink is held shut, so the queue fills: everything past it is
+        // dropped, nothing waits.
+        let total = WATCH_SINK_QUEUE + 50;
+        std::thread::spawn(move || {
+            for user in 0..total {
+                sink_bridge_callback(ctx, event(user));
+            }
+        })
+        .join()
+        .unwrap();
+        sink.gate.add_permits(total);
+        for _ in 0..200 {
+            if sink.seen.lock().unwrap().len() >= WATCH_SINK_QUEUE {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let seen = sink.seen.lock().unwrap().clone();
+        // One event may already be with the sink when the queue fills.
+        assert!(
+            (WATCH_SINK_QUEUE..=WATCH_SINK_QUEUE + 1).contains(&seen.len()),
+            "{}",
+            seen.len()
+        );
+        let expected: Vec<Option<String>> = (0..seen.len()).map(|u| Some(u.to_string())).collect();
+        assert_eq!(seen, expected, "in the order the plugin emitted them");
+        drop(bridge);
+    }
+
+    /// An oversized item is never decoded: an event source drops it, and a
+    /// resource watch still sees a bare change.
+    #[tokio::test]
+    async fn an_oversized_event_is_never_decoded() {
+        for (strict, expected) in [
+            (true, vec![Some("7".to_owned())]),
+            (false, vec![None, Some("7".to_owned())]),
+        ] {
+            let sink = Arc::new(Recording {
+                seen: std::sync::Mutex::new(Vec::new()),
+                gate: tokio::sync::Semaphore::new(10),
+            });
+            let bridge = Box::new(SinkBridge::new(
+                Arc::clone(&sink) as Arc<dyn WatchEventSink>,
+                "test.watch".to_owned(),
+                strict,
+            ));
+            let ctx = &*bridge as *const SinkBridge as usize;
+            let huge = format!(
+                "{{\"user_id\":\"big\",\"pad\":\"{}\"}}",
+                "x".repeat(WATCH_EVENT_MAX_BYTES)
+            );
+            sink_bridge_callback(ctx, RString::from(huge));
+            sink_bridge_callback(ctx, event(7));
+            for _ in 0..200 {
+                if sink.seen.lock().unwrap().len() >= expected.len() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            assert_eq!(*sink.seen.lock().unwrap(), expected, "strict: {strict}");
+            drop(bridge);
+        }
+    }
+
+    /// An event-source plugin's malformed item is dropped; a plain watch
+    /// plugin's reads as a bare change.
+    #[tokio::test]
+    async fn a_malformed_item_is_dropped_only_from_an_event_source() {
+        for (strict, expected) in [
+            (true, vec![Some("7".to_owned())]),
+            (false, vec![None, Some("7".to_owned())]),
+        ] {
+            let sink = Arc::new(Recording {
+                seen: std::sync::Mutex::new(Vec::new()),
+                gate: tokio::sync::Semaphore::new(10),
+            });
+            let bridge = Box::new(SinkBridge::new(
+                Arc::clone(&sink) as Arc<dyn WatchEventSink>,
+                "test.watch".to_owned(),
+                strict,
+            ));
+            let ctx = &*bridge as *const SinkBridge as usize;
+            sink_bridge_callback(ctx, RString::from("{not json"));
+            sink_bridge_callback(ctx, event(7));
+            for _ in 0..200 {
+                if sink.seen.lock().unwrap().len() >= expected.len() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            assert_eq!(*sink.seen.lock().unwrap(), expected, "strict: {strict}");
+            drop(bridge);
+        }
     }
 }
 

@@ -273,6 +273,7 @@ protocol_version: "1.0"
             tags: Vec::new(),
             provides: Vec::new(),
             provides_schemes: Vec::new(),
+            watch_strategies: Vec::new(),
         }
     }
 

@@ -11199,6 +11199,7 @@ mod tests {
             tags: manifest.tags.clone(),
             provides: manifest.provides.clone(),
             provides_schemes: manifest.provides_schemes.clone(),
+            watch_strategies: Vec::new(),
         }
     }
 

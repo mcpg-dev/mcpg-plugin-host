@@ -424,6 +424,7 @@ required_capabilities: []
             tags: Vec::new(),
             provides: Vec::new(),
             provides_schemes: Vec::new(),
+            watch_strategies: Vec::new(),
         };
         let mut reg = PluginRegistry::new();
         let mut r = FirstPartyRegistrar::new(&mut reg);
@@ -460,6 +461,7 @@ required_capabilities: []
             tags: Vec::new(),
             provides: Vec::new(),
             provides_schemes: Vec::new(),
+            watch_strategies: Vec::new(),
         }
     }
 

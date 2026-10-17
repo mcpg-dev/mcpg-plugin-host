@@ -107,6 +107,10 @@ impl ClusterBackend for MeteredClusterBackend {
         self.inner.key_value_store()
     }
 
+    fn key_value_store_named(&self, name: &str) -> Option<Arc<dyn KeyValueStore>> {
+        self.inner.key_value_store_named(name)
+    }
+
     fn pub_sub(&self) -> Option<Arc<dyn PubSub>> {
         self.inner.pub_sub()
     }
