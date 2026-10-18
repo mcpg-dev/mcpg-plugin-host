@@ -207,6 +207,14 @@ pub struct PluginArtifactConfig {
     /// lets a reader see it without pulling the layer.
     #[serde(default)]
     pub packaged_with_abi_version: u32,
+    /// ABI type-layout fingerprint of the PACKAGING TOOLCHAIN
+    /// (`mcpg_plugin_protocol::abi_fingerprint`), with the same provenance
+    /// as `packaged_with_abi_version`. The version stays fixed while layouts
+    /// change in place, so this is the field that tells two builds apart: a
+    /// host whose `mcpg capabilities` reports another fingerprint refuses the
+    /// plugin at load. Empty on artefacts packaged before the field.
+    #[serde(default)]
+    pub packaged_with_abi_layout: String,
 }
 
 /// Successful result of [`push`].
@@ -241,6 +249,8 @@ pub fn artifact_config_for(archive_path: &Path) -> Result<PluginArtifactConfig, 
         schema: unpacked.descriptor.schema.clone(),
         has_signature: unpacked.signature_path.is_some(),
         packaged_with_abi_version: mcpg_plugin_protocol::abi::MCPG_PLUGIN_ABI_VERSION,
+        packaged_with_abi_layout:
+            mcpg_plugin_protocol::abi_fingerprint::plugin_abi_layout_fingerprint(),
     })
 }
 
@@ -322,6 +332,31 @@ pub struct PullOutcome {
     /// MCPG media type. Useful for tooling that wants the
     /// descriptor fields without unzipping.
     pub config: Option<PluginArtifactConfig>,
+}
+
+/// Warn, before the plugin is loaded, that it was packaged for another ABI
+/// layout. A warning, not a refusal: the recorded fingerprint is the
+/// packaging toolchain's, so a third-party plugin packed by another CLI
+/// version may still load, and the load-time layout check is the authority.
+/// True when the fingerprints differ.
+pub fn warn_on_abi_layout_mismatch(reference: &str, packaged: &str) -> bool {
+    if packaged.is_empty() {
+        return false;
+    }
+    let host = mcpg_plugin_protocol::abi_fingerprint::plugin_abi_layout_fingerprint();
+    if packaged == host {
+        return false;
+    }
+    metrics::counter!("mcpg_plugin_pull_abi_layout_mismatch_total").increment(1);
+    tracing::warn!(
+        plugin = %reference,
+        packaged_abi_layout = %packaged,
+        host_abi_layout = %host,
+        "plugin was packaged for another ABI layout than this host's; the load refuses it \
+         unless it was built against this host's protocol — rebuild it, or pin a release \
+         packaged for this host"
+    );
+    true
 }
 
 /// Pull a packaged plugin from an OCI registry and write the
@@ -413,6 +448,9 @@ pub async fn pull(
     } else {
         None
     };
+    if let Some(c) = &config {
+        warn_on_abi_layout_mismatch(reference_str, &c.packaged_with_abi_layout);
+    }
 
     Ok(PullOutcome {
         manifest_digest,
@@ -553,6 +591,23 @@ mod tests {
     }
 
     #[test]
+    fn a_plugin_packaged_for_another_abi_layout_is_reported() {
+        let host = mcpg_plugin_protocol::abi_fingerprint::plugin_abi_layout_fingerprint();
+        assert!(
+            !warn_on_abi_layout_mismatch("x", ""),
+            "packaged before the field"
+        );
+        assert!(
+            !warn_on_abi_layout_mismatch("x", &host),
+            "the host's own layout"
+        );
+        assert!(warn_on_abi_layout_mismatch(
+            "x",
+            "sha256:00000000000000000000000000000000"
+        ));
+    }
+
+    #[test]
     fn plugin_artifact_config_roundtrips_json() {
         let c = PluginArtifactConfig {
             id: "dev.mcpg.test".into(),
@@ -563,11 +618,13 @@ mod tests {
             schema: "mcpg.dev/plugin/v1".into(),
             has_signature: true,
             packaged_with_abi_version: 1,
+            packaged_with_abi_layout: "sha256:0123456789abcdef0123456789abcdef".into(),
         };
         let json = serde_json::to_string(&c).unwrap();
         let back: PluginArtifactConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back.id, c.id);
         assert_eq!(back.packaged_with_abi_version, 1);
+        assert_eq!(back.packaged_with_abi_layout, c.packaged_with_abi_layout);
         // Artefacts published before this field existed carry no value; they
         // must still deserialise rather than becoming unreadable.
         let legacy = serde_json::json!({
@@ -580,6 +637,7 @@ mod tests {
             old.packaged_with_abi_version, 0,
             "absent reads as 0, not an error"
         );
+        assert_eq!(old.packaged_with_abi_layout, "", "absent reads as empty");
         assert_eq!(back.class, c.class);
         assert_eq!(back.runtime, c.runtime);
         assert!(back.has_signature);

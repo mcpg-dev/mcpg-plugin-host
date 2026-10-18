@@ -686,7 +686,9 @@ fn verify_abi_layout(library: &Library) -> Result<()> {
             anyhow!(
                 "plugin ABI layout is incompatible with the host (type-identity \
              check) — the cdylib was built against a different PluginRegistration \
-             layout; rebuild it against this host. Details: {errs:?}"
+             layout (plugin {}, host {}); rebuild it against this host. Details: {errs:?}",
+                mcpg_plugin_protocol::abi_fingerprint::layout_fingerprint(plugin_layout),
+                mcpg_plugin_protocol::abi_fingerprint::plugin_abi_layout_fingerprint(),
             )
         })?;
     Ok(())
