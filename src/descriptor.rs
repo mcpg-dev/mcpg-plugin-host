@@ -41,6 +41,8 @@ pub enum DescriptorError {
         expected: String,
         found: String,
     },
+    #[error("invalid plugin descriptor at {path}: {reason}")]
+    WatchStrategies { path: PathBuf, reason: String },
     #[error(
         "plugin descriptor disagrees with in-code manifest: field={field}, \
          descriptor={descriptor}, manifest={manifest}"
@@ -57,7 +59,9 @@ pub enum DescriptorError {
 /// The schema field is validated against
 /// [`DESCRIPTOR_SCHEMA_V1`]; an unknown schema yields
 /// [`DescriptorError::UnknownSchema`] so operators see a
-/// descriptive error instead of a partial parse.
+/// descriptive error instead of a partial parse. `watch_strategies` get the
+/// check the native loader applies to a compiled-in descriptor, so a
+/// descriptor this accepts is one a gateway loads.
 pub fn load_descriptor(path: impl AsRef<Path>) -> Result<PluginDescriptor, DescriptorError> {
     let path = path.as_ref();
     let raw = std::fs::read_to_string(path).map_err(|e| DescriptorError::Io {
@@ -76,6 +80,12 @@ pub fn load_descriptor(path: impl AsRef<Path>) -> Result<PluginDescriptor, Descr
             found: descriptor.schema,
         });
     }
+    descriptor
+        .validate_watch_strategies()
+        .map_err(|reason| DescriptorError::WatchStrategies {
+            path: path.to_path_buf(),
+            reason,
+        })?;
     Ok(descriptor)
 }
 
@@ -223,6 +233,35 @@ protocol_version: "1.0"
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn load_checks_watch_strategies_like_the_loader() {
+        let descriptor = |second_kind: &str| {
+            format!(
+                r#"
+schema: mcpg.dev/plugin/v1
+id: dev.mcpg.example
+name: Example
+class: watch_strategy
+runtime: native-cdylib-v1
+protocol_version: "1.0"
+watch_strategies:
+  - kind: changes
+    event_types: [{{ name: row.changed }}]
+  - kind: {second_kind}
+    event_types: [{{ name: row.changed }}]
+"#
+            )
+        };
+        let shared = tmp_yaml(&descriptor("cdc"));
+        assert!(load_descriptor(shared.path()).is_ok());
+        let twice = tmp_yaml(&descriptor("changes"));
+        let err = load_descriptor(twice.path()).unwrap_err();
+        assert!(
+            matches!(&err, DescriptorError::WatchStrategies { reason, .. } if reason.contains("declared twice")),
+            "{err}"
+        );
     }
 
     #[test]

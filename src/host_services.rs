@@ -297,11 +297,13 @@ impl HostServices for NullHostServices {
 /// `LateBoundBackendHost` in `mcpg-plugin-protocol`: native plugin
 /// adapters are constructed during gateway boot **before** the
 /// `PluginRegistry` is wrapped in `Arc`. The adapter receives this
-/// late-bound handle; calls before `set()` route to a
+/// late-bound handle itself (it implements [`HostServices`] and reads
+/// the binding on every call); calls before `set()` route to a
 /// [`NullHostServices`] stub that surfaces typed errors.
 #[derive(Clone)]
 pub struct LateBoundHostServices {
     inner: Arc<RwLock<Option<Arc<dyn HostServices>>>>,
+    subscriptions: Option<Arc<dyn mcpg_plugin_protocol::backend::BackendHost>>,
 }
 
 impl LateBoundHostServices {
@@ -310,7 +312,21 @@ impl LateBoundHostServices {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(None)),
+            subscriptions: None,
         }
+    }
+
+    /// Route revocation and rotation subscriptions to `host`. Plugins
+    /// subscribe while their profiles register, before [`set`](Self::set),
+    /// so `host` is a late-bound backend host that keeps them until the
+    /// real one is bound.
+    #[must_use]
+    pub fn with_subscriptions(
+        mut self,
+        host: Arc<dyn mcpg_plugin_protocol::backend::BackendHost>,
+    ) -> Self {
+        self.subscriptions = Some(host);
+        self
     }
 
     /// Resolve the underlying services. Returns a fresh
@@ -351,6 +367,120 @@ impl LateBoundHostServices {
 impl Default for LateBoundHostServices {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[async_trait]
+impl HostServices for LateBoundHostServices {
+    async fn resolve_secret(&self, alias: &str, uri: &str) -> Result<SecretValue, SecretError> {
+        self.resolve().resolve_secret(alias, uri).await
+    }
+
+    async fn issue_credential(
+        &self,
+        alias: &str,
+        uri: &str,
+        identity: PluginIdentity,
+    ) -> Result<IssuedCredential, CredentialError> {
+        self.resolve().issue_credential(alias, uri, identity).await
+    }
+
+    async fn config_snapshot(&self, alias: &str, uri: &str) -> Result<ConfigSnapshot, ConfigError> {
+        self.resolve().config_snapshot(alias, uri).await
+    }
+
+    async fn audit_event(
+        &self,
+        alias: &str,
+        event: AuditEvent,
+    ) -> Result<AuditReceipt, AuditError> {
+        self.resolve().audit_event(alias, event).await
+    }
+
+    fn metric_emit(&self, alias: &str, point: MetricPoint) {
+        self.resolve().metric_emit(alias, point);
+    }
+
+    fn span_start(&self, alias: &str, name: &str, attrs: serde_json::Value) -> u64 {
+        self.resolve().span_start(alias, name, attrs)
+    }
+
+    fn span_end(&self, span_id: u64) {
+        self.resolve().span_end(span_id);
+    }
+
+    fn span_event(&self, span_id: u64, name: &str, attrs: serde_json::Value) {
+        self.resolve().span_event(span_id, name, attrs);
+    }
+
+    async fn resolve_credentials(
+        &self,
+        alias: &str,
+        value: &mut serde_json::Value,
+        identity: Option<PluginIdentity>,
+    ) -> Result<usize, BackendHostError> {
+        self.resolve()
+            .resolve_credentials(alias, value, identity)
+            .await
+    }
+
+    async fn cache_get(
+        &self,
+        alias: &str,
+        key: &str,
+    ) -> Result<Option<bytes::Bytes>, BackendHostError> {
+        self.resolve().cache_get(alias, key).await
+    }
+
+    async fn fetch_content(
+        &self,
+        alias: &str,
+        uri: &str,
+    ) -> Result<Option<bytes::Bytes>, BackendHostError> {
+        self.resolve().fetch_content(alias, uri).await
+    }
+
+    async fn store_content(
+        &self,
+        alias: &str,
+        bytes: bytes::Bytes,
+        mime_type: String,
+        ttl: Option<std::time::Duration>,
+    ) -> Result<BackendResource, BackendHostError> {
+        self.resolve()
+            .store_content(alias, bytes, mime_type, ttl)
+            .await
+    }
+
+    async fn invoke_tool(
+        &self,
+        ctx: &BackendInvocationContext,
+        tool_name: &str,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value, BackendHostError> {
+        self.resolve().invoke_tool(ctx, tool_name, args).await
+    }
+
+    fn subscribe_credential_revoked(
+        &self,
+        alias: &str,
+        cb: CredentialRevocationCallback,
+    ) -> CredentialRevocationSubscription {
+        match &self.subscriptions {
+            Some(host) => host.subscribe_credential_revoked(cb),
+            None => self.resolve().subscribe_credential_revoked(alias, cb),
+        }
+    }
+
+    fn subscribe_secret_rotation(
+        &self,
+        alias: &str,
+        cb: SecretRotationCallback,
+    ) -> SecretRotationSubscription {
+        match &self.subscriptions {
+            Some(host) => host.subscribe_secret_rotation(cb),
+            None => self.resolve().subscribe_secret_rotation(alias, cb),
+        }
     }
 }
 

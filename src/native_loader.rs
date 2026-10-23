@@ -2074,11 +2074,17 @@ impl NativeBackendAdapter {
                 "native backend plugin returned empty manifest JSON"
             ));
         }
-        let manifest: PluginManifest =
+        let mut manifest: PluginManifest =
             serde_json::from_str(manifest_json.as_str()).map_err(|e| {
                 guard_ffi_drop(|| (vt.drop_instance)(handle));
                 anyhow::Error::from(e).context("invalid manifest from native backend plugin")
             })?;
+        // The registry reads a backend's profile off this manifest. A cdylib
+        // declares it once, in its registration, and its own manifest ships
+        // none, so take the one the loader decoded from the registration.
+        if manifest.backend_profile.is_none() {
+            manifest.backend_profile = library.meta.manifest.backend_profile.clone();
+        }
         let kind = guard_ffi_rstring("kind", || (vt.kind)(handle))
             .as_str()
             .to_owned();
