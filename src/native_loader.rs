@@ -30,9 +30,9 @@ use async_trait::async_trait;
 use libloading::{Library, Symbol};
 use mcpg_cluster_api::{
     ActiveLease, BoxActiveLease, BoxPeerEventStream, BoxPublishedMessageStream, ClusterBackend,
-    ClusterError, ClusterNodeInfo, ClusterPeer, Entry, KeyValueStore, KvEntryWire, KvListEntryWire,
-    KvListReplyWire, KvPage, PeerEvent, PubSub, PublishedMessage,
-    Subscription as PubSubSubscription,
+    ClusterError, ClusterNodeInfo, ClusterPeer, Entry, KV_VALUE_BASE64, KeyValueStore, KvEntryWire,
+    KvListEntryWire, KvListReplyWire, KvPage, PeerEvent, PubSub, PublishedMessage,
+    Subscription as PubSubSubscription, WireBytes,
 };
 use mcpg_plugin_protocol::abi::{
     ApprovalNotifierVTable, AuditSinkVTable, BackendVTable, BytesSinkRef, CacheVTable,
@@ -7376,6 +7376,18 @@ impl mcpg_plugin_protocol::catalog::CatalogProvider for NativeCatalogProviderAda
 // opaque-handle cookie convention; KV marshals its async trait via the
 // per-slot JSON arg/return DTOs.
 
+/// Whether a cluster plugin's manifest JSON lists [`KV_VALUE_BASE64`] under
+/// `wire_features`, beside the manifest's own fields.
+fn declares_kv_value_base64(manifest_json: &str) -> bool {
+    #[derive(serde::Deserialize)]
+    struct WireFeatures {
+        #[serde(default)]
+        wire_features: Vec<String>,
+    }
+    serde_json::from_str::<WireFeatures>(manifest_json)
+        .is_ok_and(|w| w.wire_features.iter().any(|f| f == KV_VALUE_BASE64))
+}
+
 fn clone_cluster(vt: &ClusterVTable) -> ClusterVTable {
     ClusterVTable {
         make: vt.make,
@@ -7665,6 +7677,9 @@ struct NativeClusterKv {
     /// The coordinator store of its own every call names, when not the
     /// shared one.
     store: Option<String>,
+    /// Values cross as base64, both ways: the plugin declared
+    /// [`KV_VALUE_BASE64`].
+    values_base64: bool,
     /// Set once a listing came back unpaged, so the warning shows once.
     unpaged_warned: std::sync::atomic::AtomicBool,
     /// Keeps the plugin instance (and cdylib) alive for the KV's life.
@@ -7725,6 +7740,23 @@ impl NativeClusterKv {
         }
     }
 
+    /// Args naming `key`, asking for a base64 value when the plugin reads it.
+    fn key_args(&self, key: &str) -> serde_json::Value {
+        let mut args = serde_json::json!({ "key": key });
+        self.ask_base64(&mut args);
+        args
+    }
+
+    /// Ask for the values of the reply as base64, when the plugin declared
+    /// [`KV_VALUE_BASE64`]; an older plugin keeps the args it knows.
+    fn ask_base64(&self, args: &mut serde_json::Value) {
+        if self.values_base64
+            && let serde_json::Value::Object(map) = args
+        {
+            map.insert("base64".to_owned(), serde_json::Value::Bool(true));
+        }
+    }
+
     /// Decode a `Result<T, ClusterError>` envelope, mapping an undecodable
     /// reply onto an `Internal` error tagged with the slot name.
     fn decode<T: serde::de::DeserializeOwned>(
@@ -7749,7 +7781,7 @@ impl NativeClusterKv {
 impl KeyValueStore for NativeClusterKv {
     async fn get(&self, key: &str) -> Result<Option<Entry>, ClusterError> {
         let raw = self
-            .call_slot(self.kv_get, "kv_get", serde_json::json!({ "key": key }))
+            .call_slot(self.kv_get, "kv_get", self.key_args(key))
             .await?;
         let wire: Option<KvEntryWire> = self.decode("kv_get", &raw)?;
         Ok(wire.map(KvEntryWire::into_entry))
@@ -7763,7 +7795,7 @@ impl KeyValueStore for NativeClusterKv {
     ) -> Result<(), ClusterError> {
         let args = serde_json::json!({
             "key": key,
-            "value": value.to_vec(),
+            "value": WireBytes::new(value.to_vec(), self.values_base64),
             "ttl_ms": ttl.map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64),
         });
         let raw = self.call_slot(self.kv_put, "kv_put", args).await?;
@@ -7778,7 +7810,7 @@ impl KeyValueStore for NativeClusterKv {
     ) -> Result<bool, ClusterError> {
         let args = serde_json::json!({
             "key": key,
-            "value": value.to_vec(),
+            "value": WireBytes::new(value.to_vec(), self.values_base64),
             "ttl_ms": ttl.map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64),
         });
         let raw = self
@@ -7804,12 +7836,13 @@ impl KeyValueStore for NativeClusterKv {
         cursor: Option<&str>,
         limit: usize,
     ) -> Result<KvPage, ClusterError> {
-        let args = serde_json::json!({
+        let mut args = serde_json::json!({
             "prefix": prefix,
             "limit": limit.max(1) as u64,
             "page": true,
             "cursor": cursor,
         });
+        self.ask_base64(&mut args);
         let raw = self
             .call_slot(self.kv_list_prefix, "kv_list_prefix", args)
             .await?;
@@ -7832,7 +7865,8 @@ impl KeyValueStore for NativeClusterKv {
         prefix: &str,
         limit: usize,
     ) -> Result<Vec<(String, Entry)>, ClusterError> {
-        let args = serde_json::json!({ "prefix": prefix, "limit": limit as u64 });
+        let mut args = serde_json::json!({ "prefix": prefix, "limit": limit as u64 });
+        self.ask_base64(&mut args);
         let raw = self
             .call_slot(self.kv_list_prefix, "kv_list_prefix", args)
             .await?;
@@ -7905,6 +7939,9 @@ pub struct NativeClusterAdapter {
     vtable: ClusterVTable,
     handle: RPluginHandle,
     manifest: PluginManifest,
+    /// The plugin's manifest declares [`KV_VALUE_BASE64`]: key/value values
+    /// cross the boundary as base64 strings, not arrays of numbers.
+    kv_value_base64: bool,
     #[allow(dead_code)]
     alias: String,
     _host_bridge: crate::host_bridge::HostBridge,
@@ -7959,6 +7996,7 @@ impl NativeClusterAdapter {
             handle: self.handle,
             plugin_id: self.manifest.id.clone(),
             store: store.map(str::to_owned),
+            values_base64: self.kv_value_base64,
             unpaged_warned: std::sync::atomic::AtomicBool::new(false),
             _instance: Arc::clone(&self.instance),
         }) as Arc<dyn KeyValueStore>)
@@ -8044,11 +8082,13 @@ impl NativeClusterAdapter {
             handle,
             drop_instance: vtable.drop_instance,
         });
+        let kv_value_base64 = declares_kv_value_base64((vtable.manifest_json)(handle).as_str());
         Self {
             library,
             vtable,
             handle,
             manifest,
+            kv_value_base64,
             alias,
             _host_bridge: crate::host_bridge::HostBridge::stub(),
             instance,
@@ -8114,6 +8154,7 @@ impl NativeClusterAdapter {
                 guard_ffi_drop(|| (vt.drop_instance)(handle));
                 anyhow::Error::from(e).context("invalid manifest from cluster plugin")
             })?;
+        let kv_value_base64 = declares_kv_value_base64(manifest_json.as_str());
         // From here on the instance handle is owned by a refcounted
         // `NativeClusterInstance`, NOT the adapter's `Drop`. Any failure
         // ABOVE this point still frees `handle` inline (the plugin owns
@@ -8128,6 +8169,7 @@ impl NativeClusterAdapter {
             vtable: vt,
             handle,
             manifest,
+            kv_value_base64,
             alias,
             _host_bridge: host_bridge,
             instance,
