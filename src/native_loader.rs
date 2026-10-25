@@ -31,7 +31,8 @@ use libloading::{Library, Symbol};
 use mcpg_cluster_api::{
     ActiveLease, BoxActiveLease, BoxPeerEventStream, BoxPublishedMessageStream, ClusterBackend,
     ClusterError, ClusterNodeInfo, ClusterPeer, Entry, KeyValueStore, KvEntryWire, KvListEntryWire,
-    PeerEvent, PubSub, PublishedMessage, Subscription as PubSubSubscription,
+    KvListReplyWire, KvPage, PeerEvent, PubSub, PublishedMessage,
+    Subscription as PubSubSubscription,
 };
 use mcpg_plugin_protocol::abi::{
     ApprovalNotifierVTable, AuditSinkVTable, BackendVTable, BytesSinkRef, CacheVTable,
@@ -7664,6 +7665,8 @@ struct NativeClusterKv {
     /// The coordinator store of its own every call names, when not the
     /// shared one.
     store: Option<String>,
+    /// Set once a listing came back unpaged, so the warning shows once.
+    unpaged_warned: std::sync::atomic::AtomicBool,
     /// Keeps the plugin instance (and cdylib) alive for the KV's life.
     _instance: Arc<NativeClusterInstance>,
 }
@@ -7793,6 +7796,35 @@ impl KeyValueStore for NativeClusterKv {
             )
             .await?;
         self.decode::<bool>("kv_delete", &raw)
+    }
+
+    async fn list_page(
+        &self,
+        prefix: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<KvPage, ClusterError> {
+        let args = serde_json::json!({
+            "prefix": prefix,
+            "limit": limit.max(1) as u64,
+            "page": true,
+            "cursor": cursor,
+        });
+        let raw = self
+            .call_slot(self.kv_list_prefix, "kv_list_prefix", args)
+            .await?;
+        let reply: KvListReplyWire = self.decode("kv_list_prefix", &raw)?;
+        if !reply.is_page()
+            && !self
+                .unpaged_warned
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            tracing::warn!(
+                plugin = %self.plugin_id,
+                "this cluster plugin build does not page key listings; a listing returns one page only — upgrade the plugin"
+            );
+        }
+        Ok(reply.into_page())
     }
 
     async fn list_prefix(
@@ -7927,6 +7959,7 @@ impl NativeClusterAdapter {
             handle: self.handle,
             plugin_id: self.manifest.id.clone(),
             store: store.map(str::to_owned),
+            unpaged_warned: std::sync::atomic::AtomicBool::new(false),
             _instance: Arc::clone(&self.instance),
         }) as Arc<dyn KeyValueStore>)
     }
@@ -9162,6 +9195,7 @@ mod tests {
             dynamic_list: true,
             pipeline_capable: true,
             transport_only_fields: vec!["/url".to_owned()],
+            usage_reporting_kinds: vec!["acme.chat".to_owned()],
         };
         let mut reg = empty_registration(MCPG_PLUGIN_ABI_VERSION);
         reg.backend_profile_json =

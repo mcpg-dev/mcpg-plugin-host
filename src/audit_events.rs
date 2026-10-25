@@ -1578,6 +1578,41 @@ pub fn quota_exceeded_event(
     }
 }
 
+/// Build a `governance.quota.warn` event: the call that moved a budget's
+/// spend across its `warn_at_pct`. The crossing charge is unique in a
+/// window, so a window warns once per measure.
+#[allow(clippy::too_many_arguments)]
+pub fn quota_warn_event(
+    actor: PluginIdentity,
+    request_id: &str,
+    backend_name: &str,
+    policy_id: &str,
+    measure: &str,
+    used: f64,
+    cap: f64,
+    warn_at_pct: u8,
+) -> AuditEvent {
+    AuditEvent {
+        event_id: new_event_id(),
+        occurred_at: now_rfc3339_utc(),
+        actor,
+        action: "governance.quota.warn".into(),
+        resource: Some(format!("tool://{backend_name}")),
+        outcome: AuditOutcome::Success,
+        request_id: Some(request_id.to_owned()),
+        upstream_request_id: None,
+        node_id: None,
+        details: serde_json::json!({
+            "policy_id": policy_id,
+            "measure": measure,
+            "used": used,
+            "cap": cap,
+            "warn_at_pct": warn_at_pct,
+        }),
+        prev_event_hash: None,
+    }
+}
+
 /// Build a `mcpg.credential.issued` event — emitted from the
 /// host-side credential resolver alongside the metric counter.
 /// Closes an audit gap: SOC2 wants every "secret

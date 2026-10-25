@@ -48,7 +48,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
-use mcpg_cluster_api::{ClusterError, Entry, KeyValueStore, Message, PubSub, Subscription};
+use mcpg_cluster_api::{ClusterError, Entry, KeyValueStore, KvPage, Message, PubSub, Subscription};
 
 use crate::credential_cache_cipher::{DecryptError, EventCipher};
 
@@ -149,6 +149,28 @@ impl EncryptingKeyValueStore {
             }
         }
     }
+
+    /// Open listed entries, each sealed under its own key as AAD. A rejected
+    /// entry (fail-closed plaintext or corrupt) is dropped, not the whole
+    /// list: `open_value` already logged and counted it.
+    fn open_entries(&self, raw: Vec<(String, Entry)>) -> Vec<(String, Entry)> {
+        let mut out = Vec::with_capacity(raw.len());
+        for (key, entry) in raw {
+            let expires_at = entry.expires_at;
+            match self.open_value(&key, &entry.bytes) {
+                Ok(Some(pt)) => out.push((
+                    key,
+                    Entry {
+                        bytes: Bytes::from(pt),
+                        expires_at,
+                    },
+                )),
+                Ok(None) => out.push((key, entry)),
+                Err(_) => continue,
+            }
+        }
+        out
+    }
 }
 
 #[async_trait]
@@ -195,32 +217,26 @@ impl KeyValueStore for EncryptingKeyValueStore {
         self.inner.delete(key).await
     }
 
+    async fn list_page(
+        &self,
+        prefix: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<KvPage, ClusterError> {
+        let page = self.inner.list_page(prefix, cursor, limit).await?;
+        Ok(KvPage {
+            entries: self.open_entries(page.entries),
+            next: page.next,
+        })
+    }
+
     async fn list_prefix(
         &self,
         prefix: &str,
         limit: usize,
     ) -> Result<Vec<(String, Entry)>, ClusterError> {
         let raw = self.inner.list_prefix(prefix, limit).await?;
-        let mut out = Vec::with_capacity(raw.len());
-        for (key, entry) in raw {
-            let expires_at = entry.expires_at;
-            // Each entry is sealed under its OWN key as AAD.
-            match self.open_value(&key, &entry.bytes) {
-                Ok(Some(pt)) => out.push((
-                    key,
-                    Entry {
-                        bytes: Bytes::from(pt),
-                        expires_at,
-                    },
-                )),
-                Ok(None) => out.push((key, entry)), // tolerated plaintext passthrough
-                // A rejected (fail-closed plaintext or corrupt) entry must not
-                // poison the whole list: open_value already logged + counted;
-                // drop just this one.
-                Err(_) => continue,
-            }
-        }
-        Ok(out)
+        Ok(self.open_entries(raw))
     }
 
     async fn expire(&self, key: &str, ttl: Option<Duration>) -> Result<bool, ClusterError> {
@@ -393,18 +409,17 @@ mod tests {
         async fn delete(&self, key: &str) -> Result<bool, ClusterError> {
             Ok(self.map.lock().unwrap().remove(key).is_some())
         }
-        async fn list_prefix(
+        async fn list_page(
             &self,
             prefix: &str,
+            cursor: Option<&str>,
             limit: usize,
-        ) -> Result<Vec<(String, Entry)>, ClusterError> {
-            Ok(self
+        ) -> Result<KvPage, ClusterError> {
+            let entries: Vec<(String, Entry)> = self
                 .map
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|(k, _)| k.starts_with(prefix))
-                .take(limit)
                 .map(|(k, v)| {
                     (
                         k.clone(),
@@ -414,7 +429,8 @@ mod tests {
                         },
                     )
                 })
-                .collect())
+                .collect();
+            Ok(KvPage::from_unordered(entries, prefix, cursor, limit))
         }
         async fn expire(&self, _key: &str, _ttl: Option<Duration>) -> Result<bool, ClusterError> {
             Ok(true)

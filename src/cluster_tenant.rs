@@ -33,7 +33,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
-use mcpg_cluster_api::{ClusterError, Entry, KeyValueStore, Message, PubSub, Subscription};
+use mcpg_cluster_api::{ClusterError, Entry, KeyValueStore, KvPage, Message, PubSub, Subscription};
 
 // ---------------------------------------------------------------------------
 // KeyValueStore decorator
@@ -91,6 +91,26 @@ impl KeyValueStore for TenantPrefixKeyValueStore {
     }
     async fn delete(&self, key: &str) -> Result<bool, ClusterError> {
         self.inner.delete(&self.full(key)).await
+    }
+    async fn list_page(
+        &self,
+        prefix: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<KvPage, ClusterError> {
+        // The cursor came from the inner store for the same full prefix.
+        let page = self
+            .inner
+            .list_page(&self.full(prefix), cursor, limit)
+            .await?;
+        Ok(KvPage {
+            entries: page
+                .entries
+                .into_iter()
+                .map(|(k, e)| (self.strip(k), e))
+                .collect(),
+            next: page.next,
+        })
     }
     async fn list_prefix(
         &self,
@@ -204,18 +224,17 @@ mod tests {
         async fn delete(&self, key: &str) -> Result<bool, ClusterError> {
             Ok(self.map.lock().unwrap().remove(key).is_some())
         }
-        async fn list_prefix(
+        async fn list_page(
             &self,
             prefix: &str,
+            cursor: Option<&str>,
             limit: usize,
-        ) -> Result<Vec<(String, Entry)>, ClusterError> {
-            Ok(self
+        ) -> Result<KvPage, ClusterError> {
+            let entries: Vec<(String, Entry)> = self
                 .map
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|(k, _)| k.starts_with(prefix))
-                .take(limit)
                 .map(|(k, v)| {
                     (
                         k.clone(),
@@ -225,7 +244,8 @@ mod tests {
                         },
                     )
                 })
-                .collect())
+                .collect();
+            Ok(KvPage::from_unordered(entries, prefix, cursor, limit))
         }
         async fn expire(&self, _k: &str, _t: Option<Duration>) -> Result<bool, ClusterError> {
             Ok(true)
@@ -322,6 +342,21 @@ mod tests {
         keys.sort();
         // Only this tenant's entries, with the head stripped back off.
         assert_eq!(keys, vec!["session:a".to_owned(), "session:b".to_owned()]);
+
+        let mut paged = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = kv
+                .list_page("session:", cursor.as_deref(), 1)
+                .await
+                .unwrap();
+            paged.extend(page.entries.into_iter().map(|(k, _)| k));
+            match page.next {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        assert_eq!(paged, vec!["session:a".to_owned(), "session:b".to_owned()]);
     }
 
     #[tokio::test]
