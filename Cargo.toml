@@ -1,6 +1,6 @@
 [package]
 name = "mcpg-plugin-host"
-version = "0.1.0-beta.48"
+version = "0.1.0-beta.49"
 license = "Apache-2.0"
 edition = "2024"
 description = "Plugin registry and loading infrastructure for MCPG"

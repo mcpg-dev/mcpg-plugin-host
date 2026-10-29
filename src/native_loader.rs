@@ -1990,6 +1990,51 @@ impl ContentStore for NativeContentStoreProfile {
 // Backend adapter
 // ---------------------------------------------------------------------------
 
+/// Values a backend derives from the registered spec of a profile alone,
+/// kept from one registration of any profile to the next.
+struct PerProfile<T> {
+    registrations: std::sync::atomic::AtomicU64,
+    values: std::sync::Mutex<std::collections::HashMap<String, (u64, T)>>,
+}
+
+impl<T: Clone> PerProfile<T> {
+    fn new() -> Self {
+        Self {
+            registrations: std::sync::atomic::AtomicU64::new(0),
+            values: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// The value of `profile`: the one kept, else what `read` answers. A
+    /// failed read (`None`) is not kept. A value is kept under the count of
+    /// registrations before its read, so one a registration overtook is
+    /// read again.
+    fn get_or_read(&self, profile: &str, read: impl FnOnce() -> Option<T>) -> Option<T> {
+        let registrations = self.registrations.load(std::sync::atomic::Ordering::SeqCst);
+        if let Some((read_under, value)) = self
+            .values
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(profile)
+            && *read_under == registrations
+        {
+            return Some(value.clone());
+        }
+        let value = read()?;
+        self.values
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(profile.to_owned(), (registrations, value.clone()));
+        Some(value)
+    }
+
+    /// A profile was registered: every value is read again.
+    fn registered(&self) {
+        self.registrations
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Adapter that implements [`BackendPlugin`] over a loaded cdylib's
 /// [`BackendVTable`]. JSON-marshalled payloads — every non-trivial type
 /// is serde-encoded across the FFI boundary (JSON is preferred over
@@ -2013,6 +2058,9 @@ pub struct NativeBackendAdapter {
     /// ferried path). Mirrors [`NativeToolGateAdapter::set_inline_fast`].
     inline_fast: bool,
     host_bridge: crate::host_bridge::HostBridge,
+    /// The audit fields of each profile, which the gateway asks for on
+    /// every call; each read is a slot call off the worker.
+    audit_fields: PerProfile<serde_json::Map<String, serde_json::Value>>,
 }
 
 unsafe impl Send for NativeBackendAdapter {}
@@ -2102,6 +2150,7 @@ impl NativeBackendAdapter {
             alias,
             inline_fast: false,
             host_bridge,
+            audit_fields: PerProfile::new(),
         })
     }
 
@@ -2164,6 +2213,8 @@ impl BackendPlugin for NativeBackendAdapter {
             move || vtable_fn(handle.ptr(), name, spec_arg),
             abi_stable::std_types::RString::new,
         );
+        // Also after a failed registration: the plugin may hold part of it.
+        self.audit_fields.registered();
         let resp_bytes = out.len();
         // Result envelope: `{"ok": null}` = success,
         // `{"err": BackendError}` = failure, any other shape
@@ -2621,18 +2672,22 @@ impl BackendPlugin for NativeBackendAdapter {
         // v36: forward the cdylib's domain-specific audit fields (e.g.
         // SQL's db.driver / db.query_ref). Best-effort — a malformed or
         // non-object return decodes to an empty map.
-        let vtable_fn = self.vtable.audit_metadata;
-        let handle = SendHandle(self.handle);
-        let name = abi_stable::std_types::RString::from(backend_name);
-        let out = call_sync_vtable_bounded(
-            self.library.ffi_limits.data_timeout,
-            move || vtable_fn(handle.ptr(), name),
-            abi_stable::std_types::RString::new,
-        );
-        match serde_json::from_str::<serde_json::Value>(out.as_str()) {
-            Ok(serde_json::Value::Object(map)) => map,
-            _ => serde_json::Map::new(),
-        }
+        self.audit_fields
+            .get_or_read(backend_name, || {
+                let vtable_fn = self.vtable.audit_metadata;
+                let handle = SendHandle(self.handle);
+                let name = abi_stable::std_types::RString::from(backend_name);
+                let out = call_sync_vtable_bounded(
+                    self.library.ffi_limits.data_timeout,
+                    move || vtable_fn(handle.ptr(), name),
+                    abi_stable::std_types::RString::new,
+                );
+                match serde_json::from_str::<serde_json::Value>(out.as_str()) {
+                    Ok(serde_json::Value::Object(map)) => Some(map),
+                    _ => None,
+                }
+            })
+            .unwrap_or_default()
     }
 
     /// Dispatch capability expansion to the cdylib
@@ -9177,6 +9232,36 @@ impl Drop for NativeTransportHandle {
 mod tests {
     use super::*;
     use abi_stable::std_types::{ROption, RString, RVec};
+
+    #[test]
+    fn a_profile_value_is_read_once_until_a_registration() {
+        let values = PerProfile::new();
+        let reads = std::cell::Cell::new(0);
+        let read = || {
+            reads.set(reads.get() + 1);
+            Some(reads.get())
+        };
+        assert_eq!(values.get_or_read("p", read), Some(1));
+        assert_eq!(values.get_or_read("p", read), Some(1));
+        assert_eq!(values.get_or_read("q", read), Some(2));
+        values.registered();
+        assert_eq!(values.get_or_read("p", read), Some(3));
+        assert_eq!(values.get_or_read("p", read), Some(3));
+    }
+
+    #[test]
+    fn a_failed_or_overtaken_read_is_read_again() {
+        let values = PerProfile::new();
+        assert_eq!(values.get_or_read("p", || None::<u32>), None);
+        assert_eq!(values.get_or_read("p", || Some(1)), Some(1));
+        values.registered();
+        let overtaken = values.get_or_read("p", || {
+            values.registered();
+            Some(2)
+        });
+        assert_eq!(overtaken, Some(2));
+        assert_eq!(values.get_or_read("p", || Some(3)), Some(3));
+    }
 
     // A panic inside a foreign cdylib's lifecycle slot must be caught
     // host-side and mapped to the sentinel value the caller already checks,
