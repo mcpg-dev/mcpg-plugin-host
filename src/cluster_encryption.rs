@@ -254,6 +254,16 @@ impl KeyValueStore for EncryptingKeyValueStore {
         // module doc's "Out of scope" note.
         self.inner.incr(key, delta, ttl).await
     }
+
+    async fn incr_floor(
+        &self,
+        key: &str,
+        delta: i64,
+        floor: i64,
+        ttl: Option<Duration>,
+    ) -> Result<i64, ClusterError> {
+        self.inner.incr_floor(key, delta, floor, ttl).await
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -131,6 +131,18 @@ impl KeyValueStore for TenantPrefixKeyValueStore {
     ) -> Result<i64, ClusterError> {
         self.inner.incr(&self.full(key), delta, ttl).await
     }
+
+    async fn incr_floor(
+        &self,
+        key: &str,
+        delta: i64,
+        floor: i64,
+        ttl: Option<Duration>,
+    ) -> Result<i64, ClusterError> {
+        self.inner
+            .incr_floor(&self.full(key), delta, floor, ttl)
+            .await
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -30,9 +30,9 @@ use async_trait::async_trait;
 use libloading::{Library, Symbol};
 use mcpg_cluster_api::{
     ActiveLease, BoxActiveLease, BoxPeerEventStream, BoxPublishedMessageStream, ClusterBackend,
-    ClusterError, ClusterNodeInfo, ClusterPeer, Entry, KV_VALUE_BASE64, KeyValueStore, KvEntryWire,
-    KvListEntryWire, KvListReplyWire, KvPage, PeerEvent, PubSub, PublishedMessage,
-    Subscription as PubSubSubscription, WireBytes,
+    ClusterError, ClusterNodeInfo, ClusterPeer, Entry, KV_INCR_FLOOR, KV_VALUE_BASE64,
+    KeyValueStore, KvEntryWire, KvListEntryWire, KvListReplyWire, KvPage, PeerEvent, PubSub,
+    PublishedMessage, Subscription as PubSubSubscription, WireBytes,
 };
 use mcpg_plugin_protocol::abi::{
     ApprovalNotifierVTable, AuditSinkVTable, BackendVTable, BytesSinkRef, CacheVTable,
@@ -7431,16 +7431,17 @@ impl mcpg_plugin_protocol::catalog::CatalogProvider for NativeCatalogProviderAda
 // opaque-handle cookie convention; KV marshals its async trait via the
 // per-slot JSON arg/return DTOs.
 
-/// Whether a cluster plugin's manifest JSON lists [`KV_VALUE_BASE64`] under
-/// `wire_features`, beside the manifest's own fields.
-fn declares_kv_value_base64(manifest_json: &str) -> bool {
+/// Whether a cluster plugin's manifest JSON lists `feature` (such as
+/// [`KV_VALUE_BASE64`]) under `wire_features`, beside the manifest's own
+/// fields.
+fn declares_wire_feature(manifest_json: &str, feature: &str) -> bool {
     #[derive(serde::Deserialize)]
     struct WireFeatures {
         #[serde(default)]
         wire_features: Vec<String>,
     }
     serde_json::from_str::<WireFeatures>(manifest_json)
-        .is_ok_and(|w| w.wire_features.iter().any(|f| f == KV_VALUE_BASE64))
+        .is_ok_and(|w| w.wire_features.iter().any(|f| f == feature))
 }
 
 fn clone_cluster(vt: &ClusterVTable) -> ClusterVTable {
@@ -7735,6 +7736,8 @@ struct NativeClusterKv {
     /// Values cross as base64, both ways: the plugin declared
     /// [`KV_VALUE_BASE64`].
     values_base64: bool,
+    /// `kv_incr` honours `floor`: the plugin declared [`KV_INCR_FLOOR`].
+    incr_floor: bool,
     /// Set once a listing came back unpaged, so the warning shows once.
     unpaged_warned: std::sync::atomic::AtomicBool,
     /// Keeps the plugin instance (and cdylib) alive for the KV's life.
@@ -7959,6 +7962,31 @@ impl KeyValueStore for NativeClusterKv {
         let raw = self.call_slot(self.kv_incr, "kv_incr", args).await?;
         self.decode::<i64>("kv_incr", &raw)
     }
+
+    async fn incr_floor(
+        &self,
+        key: &str,
+        delta: i64,
+        floor: i64,
+        ttl: Option<std::time::Duration>,
+    ) -> Result<i64, ClusterError> {
+        if !self.incr_floor {
+            return Err(ClusterError::Unsupported {
+                reason: format!(
+                    "cluster plugin `{}` does not declare {KV_INCR_FLOOR}",
+                    self.plugin_id
+                ),
+            });
+        }
+        let args = serde_json::json!({
+            "key": key,
+            "delta": delta,
+            "floor": floor,
+            "ttl_ms": ttl.map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64),
+        });
+        let raw = self.call_slot(self.kv_incr, "kv_incr", args).await?;
+        self.decode::<i64>("kv_incr", &raw)
+    }
 }
 
 /// Shared owner of the cluster plugin's instance handle + the vtable's
@@ -7997,6 +8025,9 @@ pub struct NativeClusterAdapter {
     /// The plugin's manifest declares [`KV_VALUE_BASE64`]: key/value values
     /// cross the boundary as base64 strings, not arrays of numbers.
     kv_value_base64: bool,
+    /// The plugin's manifest declares [`KV_INCR_FLOOR`]: its `kv_incr` slot
+    /// honours `floor`.
+    kv_incr_floor: bool,
     #[allow(dead_code)]
     alias: String,
     _host_bridge: crate::host_bridge::HostBridge,
@@ -8052,6 +8083,7 @@ impl NativeClusterAdapter {
             plugin_id: self.manifest.id.clone(),
             store: store.map(str::to_owned),
             values_base64: self.kv_value_base64,
+            incr_floor: self.kv_incr_floor,
             unpaged_warned: std::sync::atomic::AtomicBool::new(false),
             _instance: Arc::clone(&self.instance),
         }) as Arc<dyn KeyValueStore>)
@@ -8137,13 +8169,16 @@ impl NativeClusterAdapter {
             handle,
             drop_instance: vtable.drop_instance,
         });
-        let kv_value_base64 = declares_kv_value_base64((vtable.manifest_json)(handle).as_str());
+        let manifest_json = (vtable.manifest_json)(handle);
+        let kv_value_base64 = declares_wire_feature(manifest_json.as_str(), KV_VALUE_BASE64);
+        let kv_incr_floor = declares_wire_feature(manifest_json.as_str(), KV_INCR_FLOOR);
         Self {
             library,
             vtable,
             handle,
             manifest,
             kv_value_base64,
+            kv_incr_floor,
             alias,
             _host_bridge: crate::host_bridge::HostBridge::stub(),
             instance,
@@ -8209,7 +8244,8 @@ impl NativeClusterAdapter {
                 guard_ffi_drop(|| (vt.drop_instance)(handle));
                 anyhow::Error::from(e).context("invalid manifest from cluster plugin")
             })?;
-        let kv_value_base64 = declares_kv_value_base64(manifest_json.as_str());
+        let kv_value_base64 = declares_wire_feature(manifest_json.as_str(), KV_VALUE_BASE64);
+        let kv_incr_floor = declares_wire_feature(manifest_json.as_str(), KV_INCR_FLOOR);
         // From here on the instance handle is owned by a refcounted
         // `NativeClusterInstance`, NOT the adapter's `Drop`. Any failure
         // ABOVE this point still frees `handle` inline (the plugin owns
@@ -8225,6 +8261,7 @@ impl NativeClusterAdapter {
             handle,
             manifest,
             kv_value_base64,
+            kv_incr_floor,
             alias,
             _host_bridge: host_bridge,
             instance,

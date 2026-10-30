@@ -57,6 +57,7 @@
 //! 4. Load via the appropriate loader (native / wasm) and register
 //!    via [`crate::FirstPartyRegistrar::register_with_descriptor`].
 
+use std::borrow::Cow;
 use std::fs;
 use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -316,19 +317,25 @@ impl Package {
                 path: archive_path.to_path_buf(),
                 source: e,
             })?;
+            // For an error only: a name the archive cannot decode is shown
+            // as its bytes read lossily.
+            let shown = entry
+                .name()
+                .map(Cow::into_owned)
+                .unwrap_or_else(|_| String::from_utf8_lossy(entry.name_raw()).into_owned());
             if entry.is_dir() {
-                return Err(PackageError::UnexpectedEntry(entry.name().to_owned()));
+                return Err(PackageError::UnexpectedEntry(shown));
             }
-            // `enclosed_name` rejects absolute paths and `..`
-            // components; None means the entry escapes the archive
-            // root.
+            // `enclosed_name` rejects absolute paths, `..` components and a
+            // name that does not decode; None means the entry escapes the
+            // archive root.
             let Some(enclosed) = entry.enclosed_name() else {
-                return Err(PackageError::UnexpectedEntry(entry.name().to_owned()));
+                return Err(PackageError::UnexpectedEntry(shown));
             };
             // Defense in depth: also reject nested paths — every
             // expected entry lives at the archive root.
             if enclosed.components().count() != 1 {
-                return Err(PackageError::UnexpectedEntry(entry.name().to_owned()));
+                return Err(PackageError::UnexpectedEntry(shown));
             }
             let name = enclosed
                 .file_name()
