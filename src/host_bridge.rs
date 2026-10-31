@@ -908,6 +908,17 @@ extern "C" fn host_span_end(ctx: usize, span_id: u64) {
 extern "C" fn host_span_event(ctx: usize, span_id: u64, name: RString, attrs_json: RString) {
     let inner = unsafe { inner_ref(ctx) };
     let start = Instant::now();
+    if name.as_str() == mcpg_plugin_protocol::logs::PLUGIN_LOG_EVENT {
+        let outcome = match serde_json::from_str(attrs_json.as_str()) {
+            Ok(record) => {
+                crate::plugin_log::emit(&inner.alias, record);
+                "ok"
+            }
+            Err(_) => "err",
+        };
+        record_host_call(&inner.alias, "span_event", outcome, start);
+        return;
+    }
     let attrs = serde_json::from_str(attrs_json.as_str()).unwrap_or_else(|_| serde_json::json!({}));
     inner.services.span_event(span_id, name.as_str(), attrs);
     record_host_call(&inner.alias, "span_event", "ok", start);

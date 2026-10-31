@@ -38,6 +38,7 @@ pub mod native;
 pub mod native_loader;
 pub mod oci;
 pub mod package;
+pub(crate) mod plugin_log;
 pub(crate) mod policy_metering;
 pub mod registry;
 pub mod revocation;
