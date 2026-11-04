@@ -292,6 +292,7 @@ const HOST_SERVICES_VTABLE: HostServicesVTable = HostServicesVTable {
     alias: host_alias,
     resolve_credentials: host_resolve_credentials,
     cache_get: host_cache_get,
+    cache_put: host_cache_put,
     fetch_content: host_fetch_content,
     store_content: host_store_content,
     invoke_tool: host_invoke_tool,
@@ -494,7 +495,7 @@ extern "C" fn host_resolve_credentials(
     respond_result_rstring(&result)
 }
 
-extern "C" fn host_cache_get(ctx: usize, key: RString) -> RString {
+extern "C" fn host_cache_get(ctx: usize, binding: RString, key: RString) -> RString {
     let inner = unsafe { inner_ref(ctx) };
     let start = Instant::now();
     // Wire shape: Ok(Option<base64 string>). None = cache miss.
@@ -502,10 +503,11 @@ extern "C" fn host_cache_get(ctx: usize, key: RString) -> RString {
         Some(rt) => {
             let services = Arc::clone(&inner.services);
             let alias = inner.alias.clone();
+            let binding = binding.into_string();
             let key = key.into_string();
             block_on_host_service(
                 rt,
-                async move { services.cache_get(&alias, &key).await },
+                async move { services.cache_get(&alias, &binding, &key).await },
                 host_service_unavailable_backend,
             )
             .map(|opt| opt.map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)))
@@ -515,6 +517,53 @@ extern "C" fn host_cache_get(ctx: usize, key: RString) -> RString {
     record_host_call(
         &inner.alias,
         "cache_get",
+        if result.is_ok() { "ok" } else { "err" },
+        start,
+    );
+    respond_result_rstring(&result)
+}
+
+#[derive(serde::Deserialize)]
+struct CachePutArgs {
+    key: String,
+    value: String,
+    ttl_ms: u64,
+}
+
+extern "C" fn host_cache_put(ctx: usize, binding: RString, args_json: RString) -> RString {
+    let inner = unsafe { inner_ref(ctx) };
+    let start = Instant::now();
+    let bad = |message: String| BackendHostError::Backend {
+        tool_name: String::new(),
+        cause: mcpg_plugin_protocol::BackendError::Transport { message },
+    };
+    let result: Result<(), BackendHostError> = match &inner.runtime {
+        Some(rt) => match serde_json::from_str::<CachePutArgs>(args_json.as_str()) {
+            Ok(args) => match base64::engine::general_purpose::STANDARD.decode(&args.value) {
+                Ok(value) => {
+                    let services = Arc::clone(&inner.services);
+                    let alias = inner.alias.clone();
+                    let binding = binding.into_string();
+                    let ttl = std::time::Duration::from_millis(args.ttl_ms);
+                    block_on_host_service(
+                        rt,
+                        async move {
+                            services
+                                .cache_put(&alias, &binding, args.key, value.into(), ttl)
+                                .await
+                        },
+                        host_service_unavailable_backend,
+                    )
+                }
+                Err(e) => Err(bad(format!("cache_put: bad base64: {e}"))),
+            },
+            Err(e) => Err(bad(format!("cache_put: invalid arguments JSON: {e}"))),
+        },
+        None => Err(BackendHostError::NotImplemented),
+    };
+    record_host_call(
+        &inner.alias,
+        "cache_put",
         if result.is_ok() { "ok" } else { "err" },
         start,
     );

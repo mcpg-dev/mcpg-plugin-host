@@ -169,13 +169,30 @@ pub trait HostServices: Send + Sync + 'static {
         Ok(0)
     }
 
-    /// Look up a cached response by opaque hash key. Default: cache miss.
+    /// Look up a cached response by opaque hash key. `binding` is the
+    /// binding the plugin says the call is for; an implementation uses
+    /// it only when the plugin `alias` serves that binding. Default:
+    /// cache miss.
     async fn cache_get(
         &self,
         _alias: &str,
+        _binding: &str,
         _key: &str,
     ) -> Result<Option<bytes::Bytes>, BackendHostError> {
         Ok(None)
+    }
+
+    /// Store a response under `key`, with `binding` as for
+    /// [`Self::cache_get`]. Default: dropped.
+    async fn cache_put(
+        &self,
+        _alias: &str,
+        _binding: &str,
+        _key: String,
+        _value: bytes::Bytes,
+        _ttl: std::time::Duration,
+    ) -> Result<(), BackendHostError> {
+        Ok(())
     }
 
     /// Fetch host-stored content (multimodal inputs) by
@@ -427,9 +444,23 @@ impl HostServices for LateBoundHostServices {
     async fn cache_get(
         &self,
         alias: &str,
+        binding: &str,
         key: &str,
     ) -> Result<Option<bytes::Bytes>, BackendHostError> {
-        self.resolve().cache_get(alias, key).await
+        self.resolve().cache_get(alias, binding, key).await
+    }
+
+    async fn cache_put(
+        &self,
+        alias: &str,
+        binding: &str,
+        key: String,
+        value: bytes::Bytes,
+        ttl: std::time::Duration,
+    ) -> Result<(), BackendHostError> {
+        self.resolve()
+            .cache_put(alias, binding, key, value, ttl)
+            .await
     }
 
     async fn fetch_content(

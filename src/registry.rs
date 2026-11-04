@@ -649,6 +649,12 @@ pub struct PluginRegistry {
     /// [`crate::audit_events::DIGESTED_ACTOR_ATTRIBUTES`] under. Set after
     /// the registry is shared, and again when the configuration reloads.
     audit_digest_key: std::sync::RwLock<Option<zeroize::Zeroizing<[u8; 32]>>>,
+    /// This replica's name, stamped as `node_id` on every audit event
+    /// that carries none.
+    audit_node_id: std::sync::RwLock<Option<String>>,
+    /// The operator's `governance.audit.on_failure`, for request-path
+    /// emit sites that must refuse the operation when a record is lost.
+    audit_request_policy: std::sync::RwLock<AuditEmitPolicy>,
 }
 
 /// A loaded `credential_issuer` entity.
@@ -1160,6 +1166,8 @@ impl PluginRegistry {
             cred_resolve_ref_allowlist: HashMap::new(),
             resource_resolve_allowlist: HashMap::new(),
             audit_digest_key: std::sync::RwLock::new(None),
+            audit_node_id: std::sync::RwLock::new(None),
+            audit_request_policy: std::sync::RwLock::new(AuditEmitPolicy::FailOpen),
         }
     }
 
@@ -1172,6 +1180,66 @@ impl PluginRegistry {
             Ok(mut slot) => *slot = key,
             Err(poisoned) => *poisoned.into_inner() = key,
         }
+    }
+
+    /// The `node_id` stamped on audit events that carry none.
+    pub fn set_audit_node_id(&self, node_id: Option<String>) {
+        *self
+            .audit_node_id
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = node_id;
+    }
+
+    /// The policy [`Self::emit_request_audit_event`] applies.
+    pub fn set_audit_request_policy(&self, policy: AuditEmitPolicy) {
+        *self
+            .audit_request_policy
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = policy;
+    }
+
+    /// Emit an audit event of a request-path operation under the
+    /// operator's `on_failure` policy: `Err` under `fail_closed` when a
+    /// sink lost it, so the caller refuses the operation.
+    pub async fn emit_request_audit_event(
+        &self,
+        event: &mcpg_plugin_protocol::audit::AuditEvent,
+    ) -> Result<(), AuditEnforcementFailure> {
+        let policy = *self
+            .audit_request_policy
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.emit_audit_event_enforced(event, policy)
+            .await
+            .map(|_| ())
+    }
+
+    /// Emit a tool call's `allowed` or `completed` record under the
+    /// request policy. `Some(Deny)` when `fail_closed` lost it: a call
+    /// does not run, and a result is not returned, without its record.
+    async fn emit_tool_call_record(
+        &self,
+        event: &mcpg_plugin_protocol::audit::AuditEvent,
+        ctx: &PluginContext,
+    ) -> Option<GateDecision> {
+        let failure = self.emit_request_audit_event(event).await.err()?;
+        warn!(
+            tool_name = %ctx.tool_name,
+            action = %event.action,
+            error = %failure,
+            "tools/call refused: its audit record was lost"
+        );
+        metrics::counter!("mcpg_tool_call_audit_refusals_total", "action" => event.action.clone())
+            .increment(1);
+        Some(GateDecision::Deny {
+            http_status: 503,
+            code: -32603,
+            message: format!(
+                "tools/call refused: the audit record {} was lost",
+                event.action
+            ),
+            error_data: None,
+        })
     }
 
     /// Configure whether the registry emits `mcpg.tool.call.allowed`
@@ -1965,14 +2033,26 @@ impl PluginRegistry {
     /// that emission, and skipping the call would silence tool-call
     /// audit coverage entirely.
     pub fn emits_tool_call_allowed(&self) -> bool {
-        self.audit_emit_tool_call_allowed && self.has_serving_audit_sink()
+        self.audit_emit_tool_call_allowed && self.tool_call_audit_reachable()
     }
 
     /// `mcpg.tool.call.completed` counterpart of
     /// [`Self::emits_tool_call_allowed`], consulted before the
     /// post-dispatch chain.
     pub fn emits_tool_call_completed(&self) -> bool {
-        self.audit_emit_tool_call_completed && self.has_serving_audit_sink()
+        self.audit_emit_tool_call_completed && self.tool_call_audit_reachable()
+    }
+
+    /// A serving sink, or, under `fail_closed`, any configured sink: a
+    /// call whose sinks all stopped serving must reach the refusal.
+    fn tool_call_audit_reachable(&self) -> bool {
+        self.has_serving_audit_sink()
+            || (!self.audit_sinks.is_empty()
+                && *self
+                    .audit_request_policy
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    == AuditEmitPolicy::FailClosed)
     }
 
     /// Emit `event` to every registered sink that is currently
@@ -2006,6 +2086,19 @@ impl PluginRegistry {
             crate::audit_events::with_digested_actor_attributes(event, key.as_deref())
         };
         let event = digested.as_ref().unwrap_or(event);
+        let node_id = self
+            .audit_node_id
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let stamped = match (&event.node_id, node_id) {
+            (None, Some(node_id)) => Some(mcpg_plugin_protocol::audit::AuditEvent {
+                node_id: Some(node_id),
+                ..event.clone()
+            }),
+            _ => None,
+        };
+        let event = stamped.as_ref().unwrap_or(event);
         let mut out = Vec::with_capacity(self.audit_sinks.len());
         for sink in &self.audit_sinks {
             if !sink.state.serves_traffic() {
@@ -2070,7 +2163,19 @@ impl PluginRegistry {
         event: &mcpg_plugin_protocol::audit::AuditEvent,
         policy: AuditEmitPolicy,
     ) -> Result<Vec<AuditEmitResult>, AuditEnforcementFailure> {
-        let results = self.emit_audit_event(event).await;
+        let mut results = self.emit_audit_event(event).await;
+        if policy == AuditEmitPolicy::FailClosed {
+            // A sink that stopped serving did not keep the record either.
+            results.extend(
+                self.audit_sinks
+                    .iter()
+                    .filter(|s| !s.state.serves_traffic())
+                    .map(|s| AuditEmitResult {
+                        sink_id: s.manifest.id.clone(),
+                        result: Err(mcpg_plugin_protocol::audit::AuditError::Closed),
+                    }),
+            );
+        }
         let any_failed = results.iter().any(|r| r.result.is_err());
         match policy {
             AuditEmitPolicy::FailOpen => Ok(results),
@@ -5790,13 +5895,29 @@ impl PluginRegistry {
         meta: Option<&serde_json::Value>,
         upstream_request_id: Option<&str>,
     ) -> GateDecision {
+        self.evaluate_tool_gates_pre_from(ctx, arguments, meta, upstream_request_id, None)
+            .await
+    }
+
+    /// [`Self::evaluate_tool_gates_pre`] for a caller at `client_ip`: each
+    /// gate's per-call config carries it as `_client_ip`.
+    pub async fn evaluate_tool_gates_pre_from(
+        &self,
+        ctx: &PluginContext,
+        arguments: &serde_json::Value,
+        meta: Option<&serde_json::Value>,
+        upstream_request_id: Option<&str>,
+        client_ip: Option<std::net::IpAddr>,
+    ) -> GateDecision {
         if self.tool_gate_chain.is_empty() {
             // No chain → emit the success event so empty-chain
             // deploys still get tool-call audit coverage.
             if self.audit_emit_tool_call_allowed {
                 let event = crate::audit_events::tool_gate_allowed_event(ctx, 0, &[])
                     .with_upstream_request_id(upstream_request_id.map(str::to_owned));
-                let _ = self.emit_audit_event(&event).await;
+                if let Some(refused) = self.emit_tool_call_record(&event, ctx).await {
+                    return refused;
+                }
             }
             return GateDecision::allow();
         }
@@ -5827,10 +5948,12 @@ impl PluginRegistry {
             // any exit path after the await, wakes drain waiters
             // when the counter reaches zero.
             let _inflight = InflightGuard::acquire(&loaded.inflight);
+            let per_call = client_ip.map(|ip| config_with_client_ip(&loaded.config, ip));
+            let config = per_call.as_ref().unwrap_or(&loaded.config);
             let start = Instant::now();
             let decision = loaded
                 .instance
-                .evaluate_pre_dispatch(ctx, &current_args, meta, &loaded.config)
+                .evaluate_pre_dispatch(ctx, &current_args, meta, config)
                 .await;
             let elapsed_ms = start.elapsed().as_millis();
 
@@ -5994,7 +6117,9 @@ impl PluginRegistry {
         if self.audit_emit_tool_call_allowed {
             let event = crate::audit_events::tool_gate_allowed_event(ctx, evaluated, &chain)
                 .with_upstream_request_id(upstream_request_id.map(str::to_owned));
-            let _ = self.emit_audit_event(&event).await;
+            if let Some(refused) = self.emit_tool_call_record(&event, ctx).await {
+                return refused;
+            }
         }
         GateDecision::Allow {
             modified_arguments: if args_modified {
@@ -6025,7 +6150,9 @@ impl PluginRegistry {
                     &[],
                 )
                 .with_upstream_request_id(upstream_request_id.map(str::to_owned));
-                let _ = self.emit_audit_event(&event).await;
+                if let Some(refused) = self.emit_tool_call_record(&event, ctx).await {
+                    return refused;
+                }
             }
             return GateDecision::allow();
         }
@@ -6151,7 +6278,9 @@ impl PluginRegistry {
                 &chain,
             )
             .with_upstream_request_id(upstream_request_id.map(str::to_owned));
-            let _ = self.emit_audit_event(&event).await;
+            if let Some(refused) = self.emit_tool_call_record(&event, ctx).await {
+                return refused;
+            }
         }
         GateDecision::Allow {
             modified_arguments: None,
@@ -6497,6 +6626,23 @@ impl PluginRegistry {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// A tool gate's per-call config: its registered config with the caller's
+/// address under `_client_ip`. A non-object config is passed unchanged.
+fn config_with_client_ip(config: &serde_json::Value, ip: std::net::IpAddr) -> serde_json::Value {
+    match config {
+        serde_json::Value::Object(map) => {
+            let mut map = map.clone();
+            map.insert(
+                "_client_ip".to_owned(),
+                serde_json::Value::String(ip.to_string()),
+            );
+            serde_json::Value::Object(map)
+        }
+        serde_json::Value::Null => serde_json::json!({ "_client_ip": ip.to_string() }),
+        other => other.clone(),
+    }
+}
 
 /// Reject a non-builtin plugin that tries to serve a reserved scheme
 /// (`env://`, `file://`).
@@ -7382,6 +7528,7 @@ mod tests {
                     session_id: None,
                     identity: None,
                     idempotency: None,
+                    client: None,
                 },
             )
             .await
@@ -8202,6 +8349,105 @@ mod tests {
             .expect("fail_open always returns Ok");
         assert_eq!(results.len(), 1);
         assert!(results[0].result.is_err(), "sink failure still observable");
+    }
+
+    #[tokio::test]
+    async fn a_request_audit_follows_the_configured_policy() {
+        let mut reg = PluginRegistry::new();
+        reg.register_audit_sink(
+            failing_audit_sink("dev.test.audit.fail"),
+            PluginTier::Native,
+        )
+        .unwrap();
+        assert!(
+            reg.emit_request_audit_event(&audit_event()).await.is_ok(),
+            "fail_open is the default"
+        );
+        reg.set_audit_request_policy(AuditEmitPolicy::FailClosed);
+        assert!(
+            reg.emit_request_audit_event(&audit_event()).await.is_err(),
+            "fail_closed refuses a lost record"
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_closed_refuses_a_tool_call_whose_record_was_lost() {
+        let mut reg = PluginRegistry::new();
+        reg.register_audit_sink(
+            failing_audit_sink("dev.test.audit.fail"),
+            PluginTier::Native,
+        )
+        .unwrap();
+        let ctx = test_context();
+        let args = serde_json::json!({});
+        let result = serde_json::json!({ "content": [] });
+        assert!(
+            matches!(
+                reg.evaluate_tool_gates_pre(&ctx, &args, None, None).await,
+                GateDecision::Allow { .. }
+            ),
+            "fail_open lets the call run"
+        );
+        reg.set_audit_request_policy(AuditEmitPolicy::FailClosed);
+        assert!(matches!(
+            reg.evaluate_tool_gates_pre(&ctx, &args, None, None).await,
+            GateDecision::Deny { code: -32603, .. }
+        ));
+        assert!(matches!(
+            reg.evaluate_tool_gates_post(&ctx, &args, &result, 1, None)
+                .await,
+            GateDecision::Deny { code: -32603, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn fail_closed_counts_a_sink_that_stopped_serving_as_lost() {
+        let mut reg = PluginRegistry::new();
+        reg.register_audit_sink(audit_sink("dev.test.audit"), PluginTier::Native)
+            .unwrap();
+        reg.disable("dev.test.audit").unwrap();
+        assert!(!reg.emits_tool_call_allowed());
+        assert!(reg.emit_request_audit_event(&audit_event()).await.is_ok());
+        reg.set_audit_request_policy(AuditEmitPolicy::FailClosed);
+        assert!(
+            reg.emits_tool_call_allowed(),
+            "the call must reach the refusal"
+        );
+        let failure = reg
+            .emit_request_audit_event(&audit_event())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            failure.failed_sinks().map(|(s, _)| s).collect::<Vec<_>>(),
+            vec!["dev.test.audit"]
+        );
+        assert!(matches!(
+            reg.evaluate_tool_gates_pre(&test_context(), &serde_json::json!({}), None, None)
+                .await,
+            GateDecision::Deny { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn every_audit_event_carries_the_node_id() {
+        let sink = audit_sink("dev.test.audit.ok");
+        let mut reg = PluginRegistry::new();
+        reg.register_audit_sink(sink.clone(), PluginTier::Native)
+            .unwrap();
+        reg.set_audit_node_id(Some("gw-0".into()));
+        reg.emit_audit_event(&audit_event()).await;
+        let own = mcpg_plugin_protocol::audit::AuditEvent {
+            node_id: Some("other".into()),
+            ..audit_event()
+        };
+        reg.emit_audit_event(&own).await;
+        let emitted = sink.emitted.lock().await;
+        assert_eq!(emitted[0].node_id.as_deref(), Some("gw-0"));
+        assert_eq!(
+            emitted[1].node_id.as_deref(),
+            Some("other"),
+            "a set node_id is kept"
+        );
     }
 
     #[tokio::test]
