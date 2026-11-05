@@ -1005,9 +1005,7 @@ impl NativeToolGateAdapter {
         let inner_name = abi_stable::std_types::RString::new();
         let handle = guard_ffi_make(|| (vt.make)(host_ref, cfg, inner_name));
         if handle.is_null() {
-            return Err(anyhow!(
-                "native tool-gate plugin panicked during make (null handle returned)"
-            ));
+            return Err(make_refused("tool-gate", &alias));
         }
         let manifest_json = guard_ffi_rstring("manifest_json", || (vt.manifest_json)(handle));
         if manifest_json.as_str().is_empty() {
@@ -1237,9 +1235,7 @@ impl NativeTransformAdapter {
         let inner_name = abi_stable::std_types::RString::new();
         let handle = guard_ffi_make(|| (vt.make)(host_ref, cfg, inner_name));
         if handle.is_null() {
-            return Err(anyhow!(
-                "native transform plugin panicked during make (null handle returned)"
-            ));
+            return Err(make_refused("transform", &alias));
         }
         let manifest_json = guard_ffi_rstring("manifest_json", || (vt.manifest_json)(handle));
         if manifest_json.as_str().is_empty() {
@@ -1453,9 +1449,7 @@ impl NativeIdentityProviderAdapter {
         let inner_name = abi_stable::std_types::RString::new();
         let handle = guard_ffi_make(|| (vt.make)(host_ref, cfg, inner_name));
         if handle.is_null() {
-            return Err(anyhow!(
-                "native identity plugin panicked during make (null handle returned)"
-            ));
+            return Err(make_refused("identity", &alias));
         }
         let manifest_json = guard_ffi_rstring("manifest_json", || (vt.manifest_json)(handle));
         if manifest_json.as_str().is_empty() {
@@ -1847,9 +1841,7 @@ impl NativeContentStorePlugin {
         let inner_name = abi_stable::std_types::RString::new();
         let handle = guard_ffi_make(|| (vt.make)(host_ref, cfg, inner_name));
         if handle.is_null() {
-            return Err(anyhow!(
-                "native content_store plugin panicked during make (null handle)"
-            ));
+            return Err(make_refused("content_store", &alias));
         }
         let manifest_json = guard_ffi_rstring("manifest_json", || (vt.manifest_json)(handle));
         let manifest: PluginManifest = match parse_manifest(manifest_json.as_str(), "content_store")
@@ -2112,9 +2104,7 @@ impl NativeBackendAdapter {
         let inner_name = abi_stable::std_types::RString::new();
         let handle = guard_ffi_make(|| (vt.make)(host_ref, cfg, inner_name));
         if handle.is_null() {
-            return Err(anyhow!(
-                "native backend plugin panicked during make (null handle)"
-            ));
+            return Err(make_refused("backend", &alias));
         }
         let manifest_json = guard_ffi_rstring("manifest_json", || (vt.manifest_json)(handle));
         if manifest_json.as_str().is_empty() {
@@ -3333,9 +3323,7 @@ impl NativeWatchStrategyAdapter {
         let inner_name = abi_stable::std_types::RString::new();
         let handle = guard_ffi_make(|| (vt.make)(host_ref, cfg, inner_name));
         if handle.is_null() {
-            return Err(anyhow!(
-                "native watch plugin panicked during make (null handle)"
-            ));
+            return Err(make_refused("watch", &alias));
         }
         let manifest_json = guard_ffi_rstring("manifest_json", || (vt.manifest_json)(handle));
         if manifest_json.as_str().is_empty() {
@@ -3639,9 +3627,7 @@ impl NativeHttpRouteAdapter {
         let inner_name = abi_stable::std_types::RString::new();
         let handle = guard_ffi_make(|| (vt.make)(host_ref, cfg, inner_name));
         if handle.is_null() {
-            return Err(anyhow!(
-                "native http_route plugin panicked during make (null handle)"
-            ));
+            return Err(make_refused("http_route", &alias));
         }
         let manifest_json = guard_ffi_rstring("manifest_json", || (vt.manifest_json)(handle));
         if manifest_json.as_str().is_empty() {
@@ -3684,6 +3670,18 @@ impl Drop for NativeHttpRouteAdapter {
         guard_ffi_drop(|| (self.vtable.drop_instance)(self.handle));
         let _ = &self.library;
     }
+}
+
+/// The load error for a `make` slot that returned no handle. A plugin
+/// returns none when it refuses its config or fails to start; the reason
+/// is in its panic line, which the host cannot read across the ABI.
+fn make_refused(kind: &str, alias: &str) -> anyhow::Error {
+    anyhow!(
+        "native {kind} plugin '{alias}' refused to start: it rejected its `config:` or \
+         failed to initialise. The reason is the plugin's \"panicked at\" line just \
+         above this error in the log. Check that its config is under the `plugins[]` \
+         entry (or the sink entry that names it) and has every required key."
+    )
 }
 
 /// Host-side panic guard around a cdylib's `make` (constructor) slot,
@@ -4425,9 +4423,7 @@ impl NativeAuditSinkAdapter {
         let inner_name = abi_stable::std_types::RString::new();
         let handle = guard_ffi_make(|| (vt.make)(host_ref, cfg, inner_name));
         if handle.is_null() {
-            return Err(anyhow!(
-                "native audit_sink plugin panicked during make (null handle)"
-            ));
+            return Err(make_refused("audit_sink", &alias));
         }
         let manifest_json = guard_ffi_rstring("manifest_json", || (vt.manifest_json)(handle));
         if manifest_json.as_str().is_empty() {
@@ -4558,9 +4554,7 @@ impl NativeLogSinkAdapter {
         let inner_name = abi_stable::std_types::RString::new();
         let handle = guard_ffi_make(|| (vt.make)(host_ref, cfg, inner_name));
         if handle.is_null() {
-            return Err(anyhow!(
-                "native log_sink plugin panicked during make (null handle)"
-            ));
+            return Err(make_refused("log_sink", &alias));
         }
         let manifest_json = guard_ffi_rstring("manifest_json", || (vt.manifest_json)(handle));
         if manifest_json.as_str().is_empty() {
@@ -4794,9 +4788,7 @@ impl NativeTelemetrySinkAdapter {
         let inner_name = abi_stable::std_types::RString::new();
         let handle = guard_ffi_make(|| (vt.make)(host_ref, cfg, inner_name));
         if handle.is_null() {
-            return Err(anyhow!(
-                "native telemetry_sink plugin panicked during make (null handle)"
-            ));
+            return Err(make_refused("telemetry_sink", &alias));
         }
         let manifest_json = guard_ffi_rstring("manifest_json", || (vt.manifest_json)(handle));
         if manifest_json.as_str().is_empty() {
@@ -5053,9 +5045,7 @@ impl NativeMetricsSinkAdapter {
         let inner_name = abi_stable::std_types::RString::new();
         let handle = guard_ffi_make(|| (vt.make)(host_ref, cfg, inner_name));
         if handle.is_null() {
-            return Err(anyhow!(
-                "native metrics_sink plugin panicked during make (null handle)"
-            ));
+            return Err(make_refused("metrics_sink", &alias));
         }
         let manifest_json = guard_ffi_rstring("manifest_json", || (vt.manifest_json)(handle));
         if manifest_json.as_str().is_empty() {
@@ -5372,7 +5362,7 @@ impl NativeStoreAdapter {
         let inner_name = abi_stable::std_types::RString::new();
         let handle = guard_ffi_make(|| (vt.make)(host_ref, cfg, inner_name));
         if handle.is_null() {
-            return Err(anyhow!("native store plugin panicked during make"));
+            return Err(make_refused("store", &alias));
         }
         let manifest_json = guard_ffi_rstring("manifest_json", || (vt.manifest_json)(handle));
         if manifest_json.as_str().is_empty() {
@@ -5709,7 +5699,7 @@ impl NativeCacheAdapter {
         let inner_name = abi_stable::std_types::RString::new();
         let handle = guard_ffi_make(|| (vt.make)(host_ref, cfg, inner_name));
         if handle.is_null() {
-            return Err(anyhow!("native cache plugin panicked during make"));
+            return Err(make_refused("cache", &alias));
         }
         let manifest_json = guard_ffi_rstring("manifest_json", || (vt.manifest_json)(handle));
         if manifest_json.as_str().is_empty() {
@@ -5974,9 +5964,7 @@ impl NativeSecretProviderAdapter {
         let inner_name = abi_stable::std_types::RString::new();
         let handle = guard_ffi_make(|| (vt.make)(host_ref, cfg, inner_name));
         if handle.is_null() {
-            return Err(anyhow!(
-                "native secret_provider plugin panicked during make"
-            ));
+            return Err(make_refused("secret_provider", &alias));
         }
         let manifest_json = guard_ffi_rstring("manifest_json", || (vt.manifest_json)(handle));
         if manifest_json.as_str().is_empty() {
@@ -6236,9 +6224,7 @@ impl NativeConfigProviderAdapter {
         let inner_name = abi_stable::std_types::RString::new();
         let handle = guard_ffi_make(|| (vt.make)(host_ref, cfg, inner_name));
         if handle.is_null() {
-            return Err(anyhow!(
-                "native config_provider plugin panicked during make"
-            ));
+            return Err(make_refused("config_provider", &alias));
         }
         let manifest_json = guard_ffi_rstring("manifest_json", || (vt.manifest_json)(handle));
         if manifest_json.as_str().is_empty() {
@@ -6523,7 +6509,7 @@ impl NativePolicyEngineAdapter {
         let inner_name = abi_stable::std_types::RString::new();
         let handle = guard_ffi_make(|| (vt.make)(host_ref, cfg, inner_name));
         if handle.is_null() {
-            return Err(anyhow!("native policy_engine plugin panicked during make"));
+            return Err(make_refused("policy_engine", &alias));
         }
         let manifest_json = guard_ffi_rstring("manifest_json", || (vt.manifest_json)(handle));
         if manifest_json.as_str().is_empty() {
@@ -6757,9 +6743,7 @@ impl NativeCredentialIssuerAdapter {
         let inner_name = abi_stable::std_types::RString::new();
         let handle = guard_ffi_make(|| (vt.make)(host_ref, cfg, inner_name));
         if handle.is_null() {
-            return Err(anyhow!(
-                "native credential_issuer plugin panicked during make"
-            ));
+            return Err(make_refused("credential_issuer", &alias));
         }
         let manifest_json = guard_ffi_rstring("manifest_json", || (vt.manifest_json)(handle));
         if manifest_json.as_str().is_empty() {
@@ -7018,9 +7002,7 @@ impl NativeApprovalNotifierAdapter {
         let inner_name = abi_stable::std_types::RString::new();
         let handle = guard_ffi_make(|| (vt.make)(host_ref, cfg, inner_name));
         if handle.is_null() {
-            return Err(anyhow!(
-                "native approval_notifier plugin panicked during make"
-            ));
+            return Err(make_refused("approval_notifier", &alias));
         }
         let manifest_json = guard_ffi_rstring("manifest_json", || (vt.manifest_json)(handle));
         if manifest_json.as_str().is_empty() {
@@ -7225,9 +7207,7 @@ impl NativeCatalogProviderAdapter {
         let inner_name = abi_stable::std_types::RString::new();
         let handle = guard_ffi_make(|| (vt.make)(host_ref, cfg, inner_name));
         if handle.is_null() {
-            return Err(anyhow!(
-                "native catalog_provider plugin panicked during make"
-            ));
+            return Err(make_refused("catalog_provider", &alias));
         }
         let manifest_json = guard_ffi_rstring("manifest_json", || (vt.manifest_json)(handle));
         if manifest_json.as_str().is_empty() {
@@ -8232,7 +8212,7 @@ impl NativeClusterAdapter {
         let inner_name = abi_stable::std_types::RString::new();
         let handle = guard_ffi_make(|| (vt.make)(host_ref, cfg, inner_name));
         if handle.is_null() {
-            return Err(anyhow!("native cluster plugin panicked during make"));
+            return Err(make_refused("cluster", &alias));
         }
         let manifest_json = guard_ffi_rstring("manifest_json", || (vt.manifest_json)(handle));
         if manifest_json.as_str().is_empty() {
@@ -9068,7 +9048,7 @@ impl NativeTransportAdapter {
         let inner_name = abi_stable::std_types::RString::new();
         let handle = guard_ffi_make(|| (vt.make)(host_ref, cfg, inner_name));
         if handle.is_null() {
-            return Err(anyhow!("native transport plugin panicked during make"));
+            return Err(make_refused("transport", &alias));
         }
         let manifest_json = guard_ffi_rstring("manifest_json", || (vt.manifest_json)(handle));
         if manifest_json.as_str().is_empty() {

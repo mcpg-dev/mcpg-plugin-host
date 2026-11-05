@@ -64,8 +64,8 @@ pub use package::{
     short_name_from_id,
 };
 pub use registry::{
-    AuditEmitPolicy, AuditEmitResult, AuditEnforcementFailure, ChainIdentityOutcome,
-    HttpRouteEntry, HttpRouteOverrideEntry, HttpRouteOverrides, LoadedPluginInfo, PluginRegistry,
-    PolicyChainOutcome, RESERVED_OVERRIDE_PATH_PREFIXES,
+    AuditEmitPolicy, AuditEmitResult, AuditEnforcementFailure, AuditSinkPolicy,
+    ChainIdentityOutcome, HttpRouteEntry, HttpRouteOverrideEntry, HttpRouteOverrides,
+    LoadedPluginInfo, PluginRegistry, PolicyChainOutcome, RESERVED_OVERRIDE_PATH_PREFIXES,
 };
 pub use signature::SignaturePolicy;

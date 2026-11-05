@@ -792,6 +792,111 @@ struct LoadedAuditSinkPlugin {
     tier: PluginTier,
     state: AtomicPluginState,
     instance: Arc<dyn mcpg_plugin_protocol::audit::AuditSink>,
+    policy: AuditSinkPolicy,
+}
+
+/// Records a non-gating sink may have in flight before new ones are
+/// dropped (and counted).
+const NON_GATING_IN_FLIGHT: usize = 1024;
+
+/// How one audit sink takes part in the fan-out.
+#[derive(Debug, Clone)]
+pub struct AuditSinkPolicy {
+    /// A gating sink is awaited, counts for `on_failure: fail_closed`
+    /// and satisfies `required`. A non-gating sink gets each record in
+    /// the background and never holds up or refuses a request.
+    pub gating: bool,
+    /// Glob patterns over `action`; empty takes every action.
+    pub allow_actions: Vec<String>,
+    /// Glob patterns over `action`; a match is left out (wins over allow).
+    pub deny_actions: Vec<String>,
+    in_flight: Arc<tokio::sync::Semaphore>,
+}
+
+impl Default for AuditSinkPolicy {
+    fn default() -> Self {
+        Self::new(true, Vec::new(), Vec::new())
+    }
+}
+
+impl AuditSinkPolicy {
+    #[must_use]
+    pub fn new(gating: bool, allow_actions: Vec<String>, deny_actions: Vec<String>) -> Self {
+        Self {
+            gating,
+            allow_actions,
+            deny_actions,
+            in_flight: Arc::new(tokio::sync::Semaphore::new(NON_GATING_IN_FLIGHT)),
+        }
+    }
+
+    /// Whether this sink receives a record with `action`.
+    #[must_use]
+    pub fn accepts(&self, action: &str) -> bool {
+        if self.deny_actions.iter().any(|p| glob_match(p, action)) {
+            return false;
+        }
+        self.allow_actions.is_empty() || self.allow_actions.iter().any(|p| glob_match(p, action))
+    }
+}
+
+/// Count and time one sink's emit; warn on a failure.
+fn record_audit_emit(
+    sink_id: &str,
+    event: &mcpg_plugin_protocol::audit::AuditEvent,
+    result: &Result<
+        mcpg_plugin_protocol::audit::AuditReceipt,
+        mcpg_plugin_protocol::audit::AuditError,
+    >,
+    elapsed: Duration,
+) {
+    match result {
+        Ok(_) => {
+            metrics::counter!(
+                "mcpg_audit_events_emitted_total",
+                "sink_id" => sink_id.to_owned(),
+                "outcome" => event.outcome.to_string(),
+            )
+            .increment(1);
+        }
+        Err(e) => {
+            metrics::counter!(
+                "mcpg_audit_sink_failures_total",
+                "sink_id" => sink_id.to_owned(),
+                "kind" => e.kind_label(),
+            )
+            .increment(1);
+            warn!(plugin_id = %sink_id, error = %e, "audit sink emit failed");
+        }
+    }
+    metrics::histogram!("mcpg_audit_sink_latency_seconds", "sink_id" => sink_id.to_owned())
+        .record(elapsed.as_secs_f64());
+}
+
+/// `*` matches any run of characters (including none); every other
+/// character matches itself.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let parts: Vec<&str> = pattern.split('*').collect();
+    if parts.len() == 1 {
+        return pattern == text;
+    }
+    let mut rest = text;
+    for (i, part) in parts.iter().enumerate() {
+        if i == 0 {
+            let Some(r) = rest.strip_prefix(part) else {
+                return false;
+            };
+            rest = r;
+        } else if i == parts.len() - 1 {
+            return rest.ends_with(part);
+        } else {
+            match rest.find(part) {
+                Some(at) => rest = &rest[at + part.len()..],
+                None => return false,
+            }
+        }
+    }
+    true
 }
 
 /// A loaded `store` entity (spec §9.8). The plugin advertises its
@@ -1179,6 +1284,37 @@ impl PluginRegistry {
         match self.audit_digest_key.write() {
             Ok(mut slot) => *slot = key,
             Err(poisoned) => *poisoned.into_inner() = key,
+        }
+    }
+
+    /// `identity` with the attributes an audit `actor` digests, digested
+    /// with the same key, so another surface shows the caller exactly as
+    /// audit records do.
+    #[must_use]
+    pub fn digest_audit_identity(
+        &self,
+        identity: mcpg_plugin_protocol::PluginIdentity,
+    ) -> mcpg_plugin_protocol::PluginIdentity {
+        let key = self
+            .audit_digest_key
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let probe = mcpg_plugin_protocol::audit::AuditEvent {
+            event_id: String::new(),
+            occurred_at: String::new(),
+            actor: identity,
+            action: String::new(),
+            resource: None,
+            outcome: mcpg_plugin_protocol::audit::AuditOutcome::Success,
+            request_id: None,
+            upstream_request_id: None,
+            node_id: None,
+            details: serde_json::Value::Null,
+            prev_event_hash: None,
+        };
+        match crate::audit_events::with_digested_actor_attributes(&probe, key.as_deref()) {
+            Some(digested) => digested.actor,
+            None => probe.actor,
         }
     }
 
@@ -2005,8 +2141,26 @@ impl PluginRegistry {
             tier,
             state: AtomicPluginState::new(PluginState::Active),
             instance: plugin,
+            policy: AuditSinkPolicy::default(),
         });
         Ok(())
+    }
+
+    /// Set the fan-out policy of the audit sink registered as `name`
+    /// (its alias or its manifest id). `Err` when no sink has that name.
+    pub fn set_audit_sink_policy(&mut self, name: &str, policy: AuditSinkPolicy) -> Result<()> {
+        let mut found = false;
+        for sink in &mut self.audit_sinks {
+            if sink.alias == name || sink.manifest.id == name {
+                sink.policy = policy.clone();
+                found = true;
+            }
+        }
+        if found {
+            Ok(())
+        } else {
+            anyhow::bail!("governance.audit.sinks: no audit sink is registered as '{name}'")
+        }
     }
 
     /// Every registered audit sink's plugin id, in registration
@@ -2023,7 +2177,9 @@ impl PluginRegistry {
     /// `governance.audit.required: true` startup check consults this;
     /// operators can register a sink but disable it post-boot.
     pub fn has_serving_audit_sink(&self) -> bool {
-        self.audit_sinks.iter().any(|p| p.state.serves_traffic())
+        self.audit_sinks
+            .iter()
+            .any(|p| p.policy.gating && p.state.serves_traffic())
     }
 
     /// Whether a tools/call must produce a `mcpg.tool.call.allowed`
@@ -2046,8 +2202,8 @@ impl PluginRegistry {
     /// A serving sink, or, under `fail_closed`, any configured sink: a
     /// call whose sinks all stopped serving must reach the refusal.
     fn tool_call_audit_reachable(&self) -> bool {
-        self.has_serving_audit_sink()
-            || (!self.audit_sinks.is_empty()
+        self.audit_sinks.iter().any(|p| p.state.serves_traffic())
+            || (self.audit_sinks.iter().any(|p| p.policy.gating)
                 && *self
                     .audit_request_policy
                     .read()
@@ -2101,41 +2257,31 @@ impl PluginRegistry {
         let event = stamped.as_ref().unwrap_or(event);
         let mut out = Vec::with_capacity(self.audit_sinks.len());
         for sink in &self.audit_sinks {
-            if !sink.state.serves_traffic() {
+            if !sink.state.serves_traffic() || !sink.policy.accepts(&event.action) {
                 continue;
             }
             let sink_id = sink.manifest.id.clone();
+            if !sink.policy.gating {
+                // Off the request path: a slow or failing collector must
+                // never delay or refuse the operation the record describes.
+                let Ok(permit) = Arc::clone(&sink.policy.in_flight).try_acquire_owned() else {
+                    metrics::counter!("mcpg_audit_sink_dropped_total", "sink_id" => sink_id)
+                        .increment(1);
+                    continue;
+                };
+                let instance = Arc::clone(&sink.instance);
+                let record = event.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    let start = Instant::now();
+                    let result = instance.emit(&record).await;
+                    record_audit_emit(&sink_id, &record, &result, start.elapsed());
+                });
+                continue;
+            }
             let start = Instant::now();
             let result = sink.instance.emit(event).await;
-            let elapsed = start.elapsed();
-            match &result {
-                Ok(_) => {
-                    metrics::counter!(
-                        "mcpg_audit_events_emitted_total",
-                        "sink_id" => sink_id.clone(),
-                        "outcome" => event.outcome.to_string(),
-                    )
-                    .increment(1);
-                }
-                Err(e) => {
-                    metrics::counter!(
-                        "mcpg_audit_sink_failures_total",
-                        "sink_id" => sink_id.clone(),
-                        "kind" => e.kind_label(),
-                    )
-                    .increment(1);
-                    warn!(
-                        plugin_id = %sink_id,
-                        error = %e,
-                        "audit sink emit failed"
-                    );
-                }
-            }
-            metrics::histogram!(
-                "mcpg_audit_sink_latency_seconds",
-                "sink_id" => sink_id.clone(),
-            )
-            .record(elapsed.as_secs_f64());
+            record_audit_emit(&sink_id, event, &result, start.elapsed());
             out.push(AuditEmitResult { sink_id, result });
         }
         out
@@ -2169,7 +2315,11 @@ impl PluginRegistry {
             results.extend(
                 self.audit_sinks
                     .iter()
-                    .filter(|s| !s.state.serves_traffic())
+                    .filter(|s| {
+                        s.policy.gating
+                            && !s.state.serves_traffic()
+                            && s.policy.accepts(&event.action)
+                    })
                     .map(|s| AuditEmitResult {
                         sink_id: s.manifest.id.clone(),
                         result: Err(mcpg_plugin_protocol::audit::AuditError::Closed),
@@ -8398,6 +8548,122 @@ mod tests {
                 .await,
             GateDecision::Deny { code: -32603, .. }
         ));
+    }
+
+    #[test]
+    fn audit_routing_globs_match_actions() {
+        assert!(glob_match("mcpg.resource.*", "mcpg.resource.subscribe"));
+        assert!(glob_match("mcpg.*.poll", "mcpg.events.poll"));
+        assert!(glob_match("*", "anything"));
+        assert!(glob_match("mcpg.events.poll", "mcpg.events.poll"));
+        assert!(!glob_match("mcpg.events.poll", "mcpg.events.poller"));
+        assert!(!glob_match("mcpg.resource.*", "mcpg.tool.call.allowed"));
+        let p = AuditSinkPolicy::new(
+            true,
+            vec!["mcpg.resource.*".into()],
+            vec!["mcpg.resource.read.*".into()],
+        );
+        assert!(p.accepts("mcpg.resource.subscribe"));
+        assert!(!p.accepts("mcpg.resource.read.success"), "deny wins");
+        assert!(!p.accepts("mcpg.tool.call.allowed"));
+    }
+
+    fn action_event(action: &str) -> mcpg_plugin_protocol::audit::AuditEvent {
+        mcpg_plugin_protocol::audit::AuditEvent {
+            action: action.into(),
+            ..audit_event()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_non_gating_sink_never_refuses_and_never_counts_as_the_record() {
+        let mut reg = PluginRegistry::new();
+        reg.register_audit_sink(
+            failing_audit_sink("dev.test.audit.collector"),
+            PluginTier::Native,
+        )
+        .unwrap();
+        reg.set_audit_sink_policy(
+            "dev.test.audit.collector",
+            AuditSinkPolicy::new(false, Vec::new(), Vec::new()),
+        )
+        .unwrap();
+        reg.set_audit_request_policy(AuditEmitPolicy::FailClosed);
+        assert!(
+            reg.emit_request_audit_event(&audit_event()).await.is_ok(),
+            "a failing non-gating sink must not refuse the operation"
+        );
+        assert!(
+            !reg.has_serving_audit_sink(),
+            "a non-gating sink is not the record"
+        );
+        assert!(matches!(
+            reg.evaluate_tool_gates_pre(&test_context(), &serde_json::json!({}), None, None)
+                .await,
+            GateDecision::Allow { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_non_gating_sink_still_receives_records_in_the_background() {
+        let mut reg = PluginRegistry::new();
+        let collector = audit_sink("dev.test.audit.collector");
+        reg.register_audit_sink(collector.clone(), PluginTier::Native)
+            .unwrap();
+        reg.set_audit_sink_policy(
+            "dev.test.audit.collector",
+            AuditSinkPolicy::new(false, Vec::new(), Vec::new()),
+        )
+        .unwrap();
+        let results = reg.emit_audit_event(&audit_event()).await;
+        assert!(results.is_empty(), "a non-gating sink is not awaited");
+        for _ in 0..100 {
+            if !collector.emitted.lock().await.is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the non-gating sink never received the record");
+    }
+
+    #[tokio::test]
+    async fn routing_sends_each_sink_only_its_actions() {
+        let mut reg = PluginRegistry::new();
+        let record = audit_sink("dev.test.audit.record");
+        let presence = audit_sink("dev.test.audit.presence");
+        reg.register_audit_sink(record.clone(), PluginTier::Native)
+            .unwrap();
+        reg.register_audit_sink(presence.clone(), PluginTier::Native)
+            .unwrap();
+        reg.set_audit_sink_policy(
+            "dev.test.audit.presence",
+            AuditSinkPolicy::new(true, vec!["mcpg.resource.*".into()], Vec::new()),
+        )
+        .unwrap();
+        reg.emit_audit_event(&action_event("mcpg.resource.subscribe"))
+            .await;
+        reg.emit_audit_event(&action_event("mcpg.tool.call.allowed"))
+            .await;
+        let actions = |sink: &Arc<InMemoryAuditSink>| {
+            let sink = Arc::clone(sink);
+            async move {
+                sink.emitted
+                    .lock()
+                    .await
+                    .iter()
+                    .map(|e| e.action.clone())
+                    .collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(
+            actions(&record).await,
+            vec!["mcpg.resource.subscribe", "mcpg.tool.call.allowed"]
+        );
+        assert_eq!(actions(&presence).await, vec!["mcpg.resource.subscribe"]);
+        assert!(
+            reg.set_audit_sink_policy("dev.test.nope", AuditSinkPolicy::default())
+                .is_err()
+        );
     }
 
     #[tokio::test]
