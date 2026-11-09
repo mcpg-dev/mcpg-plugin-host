@@ -8913,6 +8913,8 @@ fn clone_transport(vt: &TransportVTable) -> TransportVTable {
         transport_handle_close: vt.transport_handle_close,
         transport_handle_drop: vt.transport_handle_drop,
         transport_handle_listen_address: vt.transport_handle_listen_address,
+        wire: vt.wire,
+        start_http: vt.start_http,
         shutdown: vt.shutdown,
         drop_instance: vt.drop_instance,
     }
@@ -8994,6 +8996,7 @@ pub struct NativeTransportAdapter {
     handle: RPluginHandle,
     manifest: PluginManifest,
     name: String,
+    wire: mcpg_plugin_protocol::transport::TransportWire,
     #[allow(dead_code)]
     alias: String,
     _host_bridge: crate::host_bridge::HostBridge,
@@ -9066,15 +9069,95 @@ impl NativeTransportAdapter {
             return Err(anyhow!("native transport plugin returned empty name"));
         }
         let name = name_rstr.as_str().to_owned();
+        let wire_name = guard_ffi_rstring("wire", || (vt.wire)(handle));
+        let Some(wire) = mcpg_plugin_protocol::transport::TransportWire::parse(wire_name.as_str())
+        else {
+            guard_ffi_drop(|| (vt.drop_instance)(handle));
+            return Err(anyhow!(
+                "native transport plugin `{name}` declares an unknown wire {:?} \
+                 (expected \"messages\" or \"http\")",
+                wire_name.as_str()
+            ));
+        };
         Ok(Self {
             library,
             vtable: vt,
             handle,
             manifest,
             name,
+            wire,
             alias,
             _host_bridge: host_bridge,
         })
+    }
+
+    /// Decode a `start` / `start_http` result into a handle; `bridge`
+    /// frees the host-side callback state when the start failed or the
+    /// handle drops.
+    fn transport_handle_from(
+        &self,
+        call: crate::ffi_metering::FfiCall,
+        result: mcpg_plugin_protocol::abi::StreamHandle,
+        bridge: TransportBridge,
+    ) -> Result<Box<dyn TransportHandle>, TransportError> {
+        let plugin_id = &self.manifest.id;
+        let resp_bytes = result.error_json.len() + result.metadata_json.len();
+        if result.handle == 0 {
+            call.end_err(resp_bytes);
+            // SAFETY: the start slot returned without a handle, so the
+            // plugin keeps no reference to the bridge.
+            unsafe { bridge.release() };
+            let err = serde_json::from_str::<TransportError>(result.error_json.as_str()).unwrap_or(
+                TransportError::Io {
+                    reason: format!("native plugin '{plugin_id}' returned undecodable error"),
+                },
+            );
+            return Err(err);
+        }
+        call.end_ok(resp_bytes);
+        let listen_address = if result.metadata_json.as_str().is_empty() {
+            None
+        } else {
+            #[derive(serde::Deserialize)]
+            struct StartMeta {
+                listen_address: Option<String>,
+            }
+            match serde_json::from_str::<StartMeta>(result.metadata_json.as_str()) {
+                Ok(meta) => meta.listen_address.filter(|s| !s.is_empty()),
+                Err(_) => None,
+            }
+        };
+        Ok(Box::new(NativeTransportHandle {
+            library: Arc::clone(&self.library),
+            close_fn: self.vtable.transport_handle_close,
+            drop_fn: self.vtable.transport_handle_drop,
+            listen_address_fn: self.vtable.transport_handle_listen_address,
+            plugin_handle: self.handle,
+            transport_handle: result.handle,
+            bridge: Some(bridge),
+            cached_listen_address: std::sync::Mutex::new(listen_address),
+        }))
+    }
+}
+
+/// The host-side callback state a started transport's plugin calls into.
+enum TransportBridge {
+    Messages(*mut DispatcherBridge),
+    Http(*mut Arc<crate::http_ingress_bridge::HttpServerBridge>),
+}
+
+impl TransportBridge {
+    /// # Safety
+    /// The plugin no longer calls through this bridge.
+    unsafe fn release(self) {
+        match self {
+            // SAFETY: Box::into_raw'd in `start`; the caller's contract.
+            Self::Messages(ptr) => unsafe { drop(Box::from_raw(ptr)) },
+            // SAFETY: from `HttpServerBridge::into_owner`; the caller's contract.
+            Self::Http(owner) => unsafe {
+                crate::http_ingress_bridge::HttpServerBridge::release(owner);
+            },
+        }
     }
 }
 
@@ -9121,59 +9204,68 @@ impl Transport for NativeTransportAdapter {
         let plugin_id = self.manifest.id.clone();
         let spawn_result =
             tokio::task::spawn_blocking(move || vtable_fn(handle.ptr(), config_json, cb)).await;
-        let result = match spawn_result {
-            Ok(r) => r,
-            Err(_) => {
-                call.end_err(0);
-                // SAFETY: bridge_ptr was Box::into_raw'd above; no
-                // callback ever fired because start panicked.
-                unsafe {
-                    drop(Box::from_raw(bridge_ptr.0));
-                }
-                return Err(TransportError::Io {
-                    reason: format!("native plugin '{plugin_id}' panicked during start"),
-                });
-            }
+        let bridge = TransportBridge::Messages(bridge_ptr.0);
+        let Ok(result) = spawn_result else {
+            call.end_err(0);
+            // SAFETY: start panicked, so the plugin holds no reference.
+            unsafe { bridge.release() };
+            return Err(TransportError::Io {
+                reason: format!("native plugin '{plugin_id}' panicked during start"),
+            });
         };
-        let resp_bytes = result.error_json.len() + result.metadata_json.len();
-        if result.handle == 0 {
-            call.end_err(resp_bytes);
-            unsafe {
-                drop(Box::from_raw(bridge_ptr.0));
-            }
-            let err = serde_json::from_str::<TransportError>(result.error_json.as_str()).unwrap_or(
-                TransportError::Io {
-                    reason: format!("native plugin '{plugin_id}' returned undecodable error"),
-                },
-            );
-            return Err(err);
+        self.transport_handle_from(call, result, bridge)
+    }
+
+    fn wire(&self) -> mcpg_plugin_protocol::transport::TransportWire {
+        self.wire
+    }
+
+    async fn start_http(
+        &self,
+        listener_config: &serde_json::Value,
+        server: Arc<dyn mcpg_plugin_protocol::transport::HttpIngressServer>,
+    ) -> Result<Box<dyn TransportHandle>, TransportError> {
+        use crate::http_ingress_bridge::HttpServerBridge;
+        if self.wire != mcpg_plugin_protocol::transport::TransportWire::Http {
+            return Err(TransportError::InvalidConfig {
+                message: format!(
+                    "transport `{}` hands the gateway JSON-RPC messages, not HTTP requests",
+                    self.name
+                ),
+            });
         }
-        call.end_ok(resp_bytes);
-        // `TransportVTable::start` returns a `StreamHandle`;
-        // the listen address (when present) is
-        // encoded into `metadata_json` as `{"listen_address": "..."}`.
-        let listen_address = if result.metadata_json.as_str().is_empty() {
-            None
-        } else {
-            #[derive(serde::Deserialize)]
-            struct StartMeta {
-                listen_address: Option<String>,
-            }
-            match serde_json::from_str::<StartMeta>(result.metadata_json.as_str()) {
-                Ok(meta) => meta.listen_address.filter(|s| !s.is_empty()),
-                Err(_) => None,
-            }
+        let keepalive: Arc<dyn std::any::Any + Send + Sync> = Arc::clone(&self.library) as _;
+        let owner = HttpServerBridge::into_owner(HttpServerBridge::new(
+            server,
+            tokio::runtime::Handle::current(),
+            keepalive,
+        ));
+        let server_ref = HttpServerBridge::ffi_ref(owner);
+        let owner_ptr = SendPtr(owner);
+        let config_str = serde_json::to_string(listener_config).unwrap_or_else(|_| "{}".into());
+        let call = crate::ffi_metering::FfiCall::begin(
+            &self.manifest.id,
+            "transport",
+            "start_http",
+            config_str.len(),
+        );
+        let config_json = abi_stable::std_types::RString::from(config_str);
+        let vtable_fn = self.vtable.start_http;
+        let handle = SendHandle(self.handle);
+        let plugin_id = self.manifest.id.clone();
+        let spawn_result =
+            tokio::task::spawn_blocking(move || vtable_fn(handle.ptr(), config_json, server_ref))
+                .await;
+        let bridge = TransportBridge::Http(owner_ptr.0);
+        let Ok(result) = spawn_result else {
+            call.end_err(0);
+            // SAFETY: start_http panicked, so the plugin holds no reference.
+            unsafe { bridge.release() };
+            return Err(TransportError::Io {
+                reason: format!("native plugin '{plugin_id}' panicked during start_http"),
+            });
         };
-        Ok(Box::new(NativeTransportHandle {
-            library: Arc::clone(&self.library),
-            close_fn: self.vtable.transport_handle_close,
-            drop_fn: self.vtable.transport_handle_drop,
-            listen_address_fn: self.vtable.transport_handle_listen_address,
-            plugin_handle: self.handle,
-            transport_handle: result.handle,
-            bridge_ptr: bridge_ptr.0,
-            cached_listen_address: std::sync::Mutex::new(listen_address),
-        }))
+        self.transport_handle_from(call, result, bridge)
     }
 
     async fn shutdown(&self) {
@@ -9188,7 +9280,7 @@ pub struct NativeTransportHandle {
     listen_address_fn: extern "C" fn(RPluginHandle, usize) -> abi_stable::std_types::RString,
     plugin_handle: RPluginHandle,
     transport_handle: usize,
-    bridge_ptr: *mut DispatcherBridge,
+    bridge: Option<TransportBridge>,
     cached_listen_address: std::sync::Mutex<Option<String>>,
 }
 
@@ -9234,12 +9326,11 @@ impl Drop for NativeTransportHandle {
     fn drop(&mut self) {
         // Tell plugin to free its transport state.
         (self.drop_fn)(self.plugin_handle, self.transport_handle);
-        // Plugin MUST NOT call the dispatcher after
-        // transport_handle_drop returns — contract of the vtable.
-        // Safe to free the bridge box now.
-        // SAFETY: bridge_ptr was Box::into_raw'd in start().
-        unsafe {
-            drop(Box::from_raw(self.bridge_ptr));
+        // Plugin MUST NOT call the bridge after transport_handle_drop
+        // returns — contract of the vtable.
+        if let Some(bridge) = self.bridge.take() {
+            // SAFETY: the plugin's transport_handle_drop returned above.
+            unsafe { bridge.release() };
         }
         let _ = &self.library;
     }

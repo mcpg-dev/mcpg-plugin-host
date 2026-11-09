@@ -23,7 +23,7 @@ use std::time::Instant;
 
 use mcpg_plugin_protocol::PluginManifest;
 use mcpg_plugin_protocol::transport::{
-    MessageDispatcher, Transport, TransportError, TransportHandle,
+    HttpIngressServer, MessageDispatcher, Transport, TransportError, TransportHandle, TransportWire,
 };
 use tracing::Instrument;
 
@@ -107,6 +107,38 @@ impl Transport for MeteredTransport {
         let result = self
             .inner
             .start(listener_config, dispatcher)
+            .instrument(span)
+            .await;
+        match &result {
+            Ok(_) => record_start_success(&self.plugin_id, &self.transport_name, started.elapsed()),
+            Err(e) => record_start_error(
+                &self.plugin_id,
+                &self.transport_name,
+                e.kind_label(),
+                started.elapsed(),
+            ),
+        }
+        result
+    }
+
+    fn wire(&self) -> TransportWire {
+        self.inner.wire()
+    }
+
+    async fn start_http(
+        &self,
+        listener_config: &serde_json::Value,
+        server: Arc<dyn HttpIngressServer>,
+    ) -> Result<Box<dyn TransportHandle>, TransportError> {
+        let span = crate::sampled_info_span!(
+            "transport_start",
+            plugin_id = %self.plugin_id,
+            transport_name = %self.transport_name,
+        );
+        let started = Instant::now();
+        let result = self
+            .inner
+            .start_http(listener_config, server)
             .instrument(span)
             .await;
         match &result {

@@ -31,6 +31,7 @@ pub mod firstparty;
 pub mod health_prober;
 pub mod host_bridge;
 pub mod host_services;
+pub(crate) mod http_ingress_bridge;
 pub(crate) mod identity_metering;
 pub mod identity_sig;
 pub mod lifecycle;
