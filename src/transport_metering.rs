@@ -4,7 +4,7 @@
 //!
 //! Unlike the secret / config decorators (which meter every
 //! dispatch), transport lifecycle events are rare — typically one
-//! `start` per transport at gateway boot + one `shutdown` at
+//! `start_http` per transport at gateway boot + one `shutdown` at
 //! drain. We meter the start call only:
 //!
 //!   - `mcpg_transport_starts_total{plugin_id, transport_name}`
@@ -15,15 +15,15 @@
 //!     kind}` — counter, Err arm only. `kind` =
 //!     `TransportError::kind_label()`.
 //!
-//! Per-message metrics belong on the `MessageDispatcher` side —
-//! they're the per-request hot path, not the transport's.
+//! Per-request metrics belong to the gateway's HTTP router — they're
+//! the per-request hot path, not the transport's.
 
 use std::sync::Arc;
 use std::time::Instant;
 
 use mcpg_plugin_protocol::PluginManifest;
 use mcpg_plugin_protocol::transport::{
-    HttpIngressServer, MessageDispatcher, Transport, TransportError, TransportHandle, TransportWire,
+    HttpIngressServer, Transport, TransportError, TransportHandle,
 };
 use tracing::Instrument;
 
@@ -91,45 +91,13 @@ impl Transport for MeteredTransport {
         self.inner.name()
     }
 
-    async fn start(
-        &self,
-        listener_config: &serde_json::Value,
-        dispatcher: Arc<dyn MessageDispatcher>,
-    ) -> Result<Box<dyn TransportHandle>, TransportError> {
-        // Plugin-attributed span so transport-start
-        // traces resolve back to the transport plugin id.
-        let span = crate::sampled_info_span!(
-            "transport_start",
-            plugin_id = %self.plugin_id,
-            transport_name = %self.transport_name,
-        );
-        let started = Instant::now();
-        let result = self
-            .inner
-            .start(listener_config, dispatcher)
-            .instrument(span)
-            .await;
-        match &result {
-            Ok(_) => record_start_success(&self.plugin_id, &self.transport_name, started.elapsed()),
-            Err(e) => record_start_error(
-                &self.plugin_id,
-                &self.transport_name,
-                e.kind_label(),
-                started.elapsed(),
-            ),
-        }
-        result
-    }
-
-    fn wire(&self) -> TransportWire {
-        self.inner.wire()
-    }
-
     async fn start_http(
         &self,
         listener_config: &serde_json::Value,
         server: Arc<dyn HttpIngressServer>,
     ) -> Result<Box<dyn TransportHandle>, TransportError> {
+        // Plugin-attributed span so transport-start
+        // traces resolve back to the transport plugin id.
         let span = crate::sampled_info_span!(
             "transport_start",
             plugin_id = %self.plugin_id,

@@ -3802,8 +3802,8 @@ impl PluginRegistry {
 
     /// Look up the transport plugin registered under `name`.
     /// `None` if no transport is registered. Callers start the
-    /// transport themselves by calling `start` on the returned
-    /// Arc with their dispatcher + listener config.
+    /// transport themselves by calling `start_http` on the returned
+    /// Arc with their listener config and HTTP ingress server.
     pub fn transport_by_name(
         &self,
         name: &str,
@@ -9988,10 +9988,10 @@ mod tests {
         fn name(&self) -> &str {
             &self.name
         }
-        async fn start(
+        async fn start_http(
             &self,
             _listener_config: &serde_json::Value,
-            _dispatcher: Arc<dyn mcpg_plugin_protocol::transport::MessageDispatcher>,
+            _server: Arc<dyn mcpg_plugin_protocol::transport::HttpIngressServer>,
         ) -> Result<
             Box<dyn mcpg_plugin_protocol::transport::TransportHandle>,
             mcpg_plugin_protocol::transport::TransportError,

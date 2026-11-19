@@ -545,11 +545,12 @@ pub fn resource_unsubscribe_event(
     }
 }
 
-/// Build a `mcpg.elicitation.requested` event — emitted when the
-/// gateway sends a server-initiated `elicitation/create` to the
-/// client (typically from a pipeline step). A
+/// Build a `mcpg.elicitation.requested` event — emitted when a
+/// pipeline step suspends the call and asks the client for an
+/// `elicitation/create` answer (an `InputRequiredResult`). A
 /// "client surface manipulation" record so auditors see when the
-/// gateway prompted a user mid-flow.
+/// gateway prompted a user mid-flow. `server_request_id` is the id
+/// of that pending input request.
 #[must_use]
 pub fn elicitation_requested_event(
     actor: PluginIdentity,
@@ -581,49 +582,13 @@ pub fn elicitation_requested_event(
     }
 }
 
-/// Build a `mcpg.elicitation.completed` event — emitted when the
-/// client posts `notifications/elicitation/complete`.
-/// Pairs with `mcpg.elicitation.requested` for symmetry. `action`
-/// is the user's response:
-/// `"accept"` / `"decline"` / `"cancel"` — declined and cancelled
-/// flow the same way through the pipeline but compliance auditors
-/// want them distinguishable.
-#[must_use]
-pub fn elicitation_completed_event(
-    ctx: &PluginContext,
-    elicitation_id: &str,
-    user_action: &str,
-) -> AuditEvent {
-    let outcome = match user_action {
-        "accept" => AuditOutcome::Success,
-        "decline" | "cancel" => AuditOutcome::Denied,
-        _ => AuditOutcome::Failure,
-    };
-    AuditEvent {
-        event_id: new_event_id(),
-        occurred_at: now_rfc3339_utc(),
-        actor: ctx.identity.clone(),
-        action: "mcpg.elicitation.completed".into(),
-        resource: Some(format!("elicitation://{elicitation_id}")),
-        outcome,
-        request_id: Some(ctx.request_id.clone()),
-        upstream_request_id: None,
-        node_id: None,
-        details: serde_json::json!({
-            "elicitation_id": elicitation_id,
-            "user_action": user_action,
-            "transport": ctx.transport,
-        }),
-        prev_event_hash: None,
-    }
-}
-
-/// Build a `mcpg.roots.requested` event — emitted when the gateway
-/// sends a server-initiated `roots/list` to the client. A
-/// disclosure event — the server learned something about the
-/// client's filesystem boundaries. Less risky than sampling but
-/// enterprise audit wants every server→client capability probe on
-/// record.
+/// Build a `mcpg.roots.requested` event — emitted when a pipeline
+/// step suspends the call and asks the client for a `roots/list`
+/// answer (an `InputRequiredResult`). A disclosure event — the
+/// server learns something about the client's filesystem
+/// boundaries. Less risky than sampling but enterprise audit wants
+/// every server→client capability probe on record.
+/// `server_request_id` is the id of that pending input request.
 #[must_use]
 pub fn roots_requested_event(
     actor: PluginIdentity,
@@ -876,13 +841,12 @@ pub fn payment_outcome_event(
     }
 }
 
-/// Build a `mcpg.sampling.created` event — emitted when the
-/// gateway proxies a `sampling/createMessage` request from a
-/// pipeline step to the client. Closes an enterprise audit
-/// gap: critical for cost attribution + AI
-/// governance ("who asked the gateway to spend tokens, what
-/// model, what prompt"). Today only `mcpg_pipeline_suspensions_total`
-/// counts these — no per-request audit trail.
+/// Build a `mcpg.sampling.created` event — emitted when a pipeline
+/// step suspends the call and asks the client for a
+/// `sampling/createMessage` answer (an `InputRequiredResult`).
+/// Critical for cost attribution + AI governance ("who asked the
+/// gateway to spend tokens, what model, what prompt").
+/// `server_request_id` is the id of that pending input request.
 ///
 /// `prompt_hash` is a stable correlation key (the gateway
 /// computes BLAKE3 of the canonical message form). Auditors
@@ -947,9 +911,9 @@ pub fn sampling_requested_event(
 /// `auth_method` is the verifier kind that rejected the
 /// credential: `"oidc"` / `"jwt"` / `"mtls"` etc. `reason` is
 /// the verifier's structured rejection string (already designed
-/// to be safe to log). `request_id` is the inbound request id;
-/// auditors join this against subsequent `mcpg.session.opened`
-/// events on the same request_id to spot pattern attacks.
+/// to be safe to log). `request_id` is the inbound request id, so
+/// auditors can correlate the failure with the request's other
+/// events.
 ///
 /// Actor is set to [`system_identity`] since by definition there
 /// is no verified actor — the credential failed to verify.
@@ -983,62 +947,17 @@ pub fn auth_failed_event(
     }
 }
 
-/// Build a `mcpg.session.opened` event — emitted at the success
-/// path of `LifecycleOperation::Initialize`. Closes an enterprise
-/// audit gap: SOC2 wants session-time
-/// bracketing per identity for "user X had an active session
-/// from T1 to T2." Without this event, only `gateway_started` /
-/// `gateway_stopping` mark time boundaries — operators can't
-/// reconstruct per-user session windows.
-///
-/// `actor` is the request identity at initialize time —
-/// resolved by the identity-resolution chain that ran before
-/// the dispatch reached the lifecycle handler. Sessions don't
-/// carry the actor in the snapshot today, so the matching
-/// `session.terminated` event uses [`system_identity`] until
-/// actor stash is added.
-#[must_use]
-pub fn session_opened_event(
-    actor: PluginIdentity,
-    session_id: &str,
-    protocol_version: &str,
-    client_name: &str,
-    client_version: &str,
-    transport: &str,
-) -> AuditEvent {
-    AuditEvent {
-        event_id: new_event_id(),
-        occurred_at: now_rfc3339_utc(),
-        actor,
-        action: "mcpg.session.opened".into(),
-        resource: Some(format!("session://{session_id}")),
-        outcome: AuditOutcome::Success,
-        request_id: None,
-        upstream_request_id: None,
-        node_id: None,
-        details: serde_json::json!({
-            "session_id": session_id,
-            "protocol_version": protocol_version,
-            "client_name": client_name,
-            "client_version": client_version,
-            "transport": transport,
-        }),
-        prev_event_hash: None,
-    }
-}
-
 /// Build a `mcpg.session.terminated` event — emitted from
-/// `GatewayRuntime::terminate_session` when a session is removed
-/// (explicit DELETE / quota rollback / shutdown / idle expiry —
-/// `reason` distinguishes). Carries `duration_secs` so auditors
-/// can reconstruct session windows + spot anomalously long-lived
+/// `GatewayRuntime::terminate_session` when a gateway session row
+/// (the per-principal state that carries tasks, input requests and
+/// subscriptions) ends (admin terminate / quota rollback /
+/// shutdown / idle expiry — `reason` distinguishes). Carries
+/// `duration_secs` so auditors can spot anomalously long-lived
 /// sessions.
 ///
-/// Actor resolution: today the session snapshot doesn't carry
-/// the original actor identity, so this event uses
-/// [`system_identity`]. Auditors join opened ↔ terminated via
-/// the shared `details.session_id` to recover the actor from
-/// the matching `mcpg.session.opened` event.
+/// The session snapshot doesn't carry the actor identity, so this
+/// event uses [`system_identity`]; `details.session_id` joins it to
+/// the request events that carried the same session id.
 #[must_use]
 pub fn session_terminated_event(
     session_id: &str,
@@ -1976,66 +1895,8 @@ pub fn cluster_leader_event(
 }
 
 // ---------------------------------------------------------------------------
-// Low-priority protocol bookend events
+// Protocol notification events
 // ---------------------------------------------------------------------------
-
-/// Build a `mcpg.ping.received` event — emitted at the
-/// `ping` handler. Low compliance value; emitted only
-/// when the operator explicitly enables `audit.emit.ping = true`
-/// to avoid drowning the SIEM at typical keepalive rates.
-#[must_use]
-pub fn ping_received_event(
-    actor: PluginIdentity,
-    request_id: &str,
-    session_id: Option<&str>,
-    transport: &str,
-) -> AuditEvent {
-    AuditEvent {
-        event_id: new_event_id(),
-        occurred_at: now_rfc3339_utc(),
-        actor,
-        action: "mcpg.ping.received".into(),
-        resource: Some("system://ping".into()),
-        outcome: AuditOutcome::Success,
-        request_id: Some(request_id.to_owned()),
-        upstream_request_id: None,
-        node_id: None,
-        details: serde_json::json!({
-            "session_id": session_id,
-            "transport": transport,
-        }),
-        prev_event_hash: None,
-    }
-}
-
-/// Build a `mcpg.session.initialized_acked` event — emitted at the
-/// `notifications/initialized` handler when the client confirms
-/// handshake completion. Pairs with
-/// `mcpg.session.opened` at Initialize-success; together they
-/// bookend the negotiation phase.
-#[must_use]
-pub fn session_initialized_acked_event(
-    actor: PluginIdentity,
-    session_id: Option<&str>,
-    transport: &str,
-) -> AuditEvent {
-    AuditEvent {
-        event_id: new_event_id(),
-        occurred_at: now_rfc3339_utc(),
-        actor,
-        action: "mcpg.session.initialized_acked".into(),
-        resource: session_id.map(|s| format!("session://{s}")),
-        outcome: AuditOutcome::Success,
-        request_id: None,
-        upstream_request_id: None,
-        node_id: None,
-        details: serde_json::json!({
-            "session_id": session_id,
-            "transport": transport,
-        }),
-        prev_event_hash: None,
-    }
-}
 
 /// Build a `mcpg.progress.notified` event — emitted at the central
 /// outbound progress-notification site (per chunk for streaming
@@ -2074,7 +1935,8 @@ pub fn progress_notified_event(
 
 /// Build a `mcpg.list.changed_broadcast` event — emitted when the
 /// gateway broadcasts a `notifications/{tools,prompts,resources}/
-/// list_changed` to a session after a config reload.
+/// list_changed` to its sessions after a config reload; a
+/// `subscriptions/listen` stream delivers it to the client.
 /// `kind` distinguishes the catalog whose contents changed.
 #[must_use]
 pub fn list_changed_event(kind: &str, session_count: u64) -> AuditEvent {
@@ -2091,37 +1953,6 @@ pub fn list_changed_event(kind: &str, session_count: u64) -> AuditEvent {
         details: serde_json::json!({
             "kind": kind,
             "session_count": session_count,
-        }),
-        prev_event_hash: None,
-    }
-}
-
-/// Build a `mcpg.logging.level_set` event — emitted at the
-/// `logging/setLevel` handler when a client adjusts its output
-/// verbosity. Could roll into
-/// `mcpg.session.config_changed` if a future client uses level
-/// changes for sensitive purposes; standalone for now to keep the
-/// taxonomy explicit.
-#[must_use]
-pub fn logging_level_set_event(
-    actor: PluginIdentity,
-    request_id: &str,
-    session_id: Option<&str>,
-    level: &str,
-) -> AuditEvent {
-    AuditEvent {
-        event_id: new_event_id(),
-        occurred_at: now_rfc3339_utc(),
-        actor,
-        action: "mcpg.logging.level_set".into(),
-        resource: session_id.map(|s| format!("session://{s}")),
-        outcome: AuditOutcome::Success,
-        request_id: Some(request_id.to_owned()),
-        upstream_request_id: None,
-        node_id: None,
-        details: serde_json::json!({
-            "session_id": session_id,
-            "level": level,
         }),
         prev_event_hash: None,
     }
@@ -2482,37 +2313,14 @@ mod tests {
         assert_eq!(ev.details["reason"], "prompt_not_registered");
     }
 
-    // -- session bookend events --------------------------------------
-
-    #[test]
-    fn session_opened_event_carries_protocol_and_client_info() {
-        let actor = sample_ctx().identity;
-        let ev = session_opened_event(
-            actor,
-            "sess-abc-123",
-            "2026-04-30",
-            "test-client",
-            "1.4.2",
-            "http",
-        );
-        assert_eq!(ev.action, "mcpg.session.opened");
-        assert_eq!(ev.outcome, AuditOutcome::Success);
-        assert_eq!(ev.resource.as_deref(), Some("session://sess-abc-123"));
-        assert_eq!(ev.details["session_id"], "sess-abc-123");
-        assert_eq!(ev.details["protocol_version"], "2026-04-30");
-        assert_eq!(ev.details["client_name"], "test-client");
-        assert_eq!(ev.details["client_version"], "1.4.2");
-        assert_eq!(ev.details["transport"], "http");
-        // Actor preserved from request context.
-        assert_eq!(ev.actor.subject_id.as_deref(), Some("alice"));
-    }
+    // -- session end event ---------------------------------------------
 
     #[test]
     fn session_terminated_event_carries_duration_and_reason() {
         let ev = session_terminated_event(
             "sess-abc-123",
             42.5,
-            "client_terminated",
+            "admin_terminated",
             Some("test-client"),
         );
         assert_eq!(ev.action, "mcpg.session.terminated");
@@ -2520,7 +2328,7 @@ mod tests {
         assert_eq!(ev.resource.as_deref(), Some("session://sess-abc-123"));
         assert_eq!(ev.details["session_id"], "sess-abc-123");
         assert!((ev.details["duration_secs"].as_f64().unwrap() - 42.5).abs() < f64::EPSILON);
-        assert_eq!(ev.details["reason"], "client_terminated");
+        assert_eq!(ev.details["reason"], "admin_terminated");
         assert_eq!(ev.details["client_name"], "test-client");
         // Actor stashed as the system identity (see builder docs).
         assert_eq!(ev.actor.kind, "system");
@@ -2599,9 +2407,8 @@ mod tests {
         assert_eq!(ev.details["max_tokens"], 2048);
         assert_eq!(ev.details["model_hint"], "claude-sonnet-4");
         assert_eq!(ev.details["include_context"], "thisServer");
-        // Actor is the original session caller — auditors join
-        // sampling.created against the session.opened event by
-        // request_id / session_id to recover full attribution.
+        // Actor is the original caller; `request_id` and `session_id` tie
+        // the event to that caller's request.
         assert_eq!(ev.actor.subject_id.as_deref(), Some("alice"));
     }
 
@@ -2710,19 +2517,6 @@ mod tests {
         assert_eq!(ev.resource.as_deref(), Some("elicitation://ask_user"));
         assert_eq!(ev.details["server_request_id"], "srv-req-99");
         assert_eq!(ev.details["mode"], "form");
-    }
-
-    #[test]
-    fn elicitation_completed_event_outcome_per_action() {
-        let ctx = sample_ctx();
-        let accept = elicitation_completed_event(&ctx, "elicit-1", "accept");
-        assert_eq!(accept.outcome, AuditOutcome::Success);
-        let decline = elicitation_completed_event(&ctx, "elicit-1", "decline");
-        assert_eq!(decline.outcome, AuditOutcome::Denied);
-        let cancel = elicitation_completed_event(&ctx, "elicit-1", "cancel");
-        assert_eq!(cancel.outcome, AuditOutcome::Denied);
-        let weird = elicitation_completed_event(&ctx, "elicit-1", "garbage");
-        assert_eq!(weird.outcome, AuditOutcome::Failure);
     }
 
     // -- roots/list event --------------------------------------------
@@ -3325,23 +3119,6 @@ mod tests {
     }
 
     #[test]
-    fn ping_received_event_records_transport() {
-        let actor = sample_ctx().identity;
-        let ev = ping_received_event(actor, "req-1", Some("sess-2"), "stdio");
-        assert_eq!(ev.action, "mcpg.ping.received");
-        assert_eq!(ev.resource.as_deref(), Some("system://ping"));
-        assert_eq!(ev.details["transport"], "stdio");
-    }
-
-    #[test]
-    fn session_initialized_acked_event_carries_session() {
-        let actor = sample_ctx().identity;
-        let ev = session_initialized_acked_event(actor, Some("sess-99"), "http");
-        assert_eq!(ev.action, "mcpg.session.initialized_acked");
-        assert_eq!(ev.resource.as_deref(), Some("session://sess-99"));
-    }
-
-    #[test]
     fn progress_notified_event_carries_progress_value() {
         let actor = sample_ctx().identity;
         let ev = progress_notified_event(actor, "tok-7", Some("sess-2"), 0.42, Some(1.0));
@@ -3358,15 +3135,6 @@ mod tests {
         assert_eq!(ev.resource.as_deref(), Some("catalog://tools"));
         assert_eq!(ev.details["kind"], "tools");
         assert_eq!(ev.details["session_count"], 12);
-    }
-
-    #[test]
-    fn logging_level_set_event_carries_level() {
-        let actor = sample_ctx().identity;
-        let ev = logging_level_set_event(actor, "req-3", Some("sess-2"), "debug");
-        assert_eq!(ev.action, "mcpg.logging.level_set");
-        assert_eq!(ev.resource.as_deref(), Some("session://sess-2"));
-        assert_eq!(ev.details["level"], "debug");
     }
 
     #[test]

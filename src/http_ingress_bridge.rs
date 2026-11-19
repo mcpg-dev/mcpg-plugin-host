@@ -1,6 +1,6 @@
-//! Host side of the `http` transport wire.
+//! Host side of a transport's HTTP ingress.
 //!
-//! A native `http`-wire transport calls [`HttpServerRef::serve`] per
+//! A native transport calls [`HttpServerRef::serve`] per
 //! received request. The call returns at once: the request runs on the
 //! host runtime against the gateway's [`HttpIngressServer`], and the answer
 //! goes back through the plugin's [`HttpResponderRef`].
@@ -31,7 +31,7 @@ const STALL_LIMIT: Duration = Duration::from_secs(60);
 /// The longest pause between two offers to a full queue.
 const MAX_BACKOFF: Duration = Duration::from_millis(50);
 
-/// The host's server state behind one started `http`-wire transport.
+/// The host's server state behind one started transport.
 pub(crate) struct HttpServerBridge {
     server: Arc<dyn HttpIngressServer>,
     rt: tokio::runtime::Handle,

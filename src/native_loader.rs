@@ -37,11 +37,11 @@ use mcpg_cluster_api::{
 use mcpg_plugin_protocol::abi::{
     ApprovalNotifierVTable, AuditSinkVTable, BackendVTable, BytesSinkRef, CacheVTable,
     CatalogProviderVTable, ClusterVTable, ConfigProviderVTable, ContentStoreVTable,
-    CredentialIssuerVTable, DispatcherCallbackRef, DispatcherCallbackResult, EventSinkRef,
-    HttpRouteVTable, IdentityProviderVTable, LogSinkVTable, MCPG_PLUGIN_ABI_VERSION,
-    MCPG_PLUGIN_REGISTER_SYMBOL, MetricsSinkVTable, PluginRegisterFn, PluginRegistration,
-    PolicyEngineVTable, RPluginContext, RPluginHandle, SecretProviderVTable, StoreVTable,
-    TelemetrySinkVTable, ToolGateVTable, TransformVTable, TransportVTable, WatchStrategyVTable,
+    CredentialIssuerVTable, EventSinkRef, HttpRouteVTable, IdentityProviderVTable, LogSinkVTable,
+    MCPG_PLUGIN_ABI_VERSION, MCPG_PLUGIN_REGISTER_SYMBOL, MetricsSinkVTable, PluginRegisterFn,
+    PluginRegistration, PolicyEngineVTable, RPluginContext, RPluginHandle, SecretProviderVTable,
+    StoreVTable, TelemetrySinkVTable, ToolGateVTable, TransformVTable, TransportVTable,
+    WatchStrategyVTable,
 };
 use mcpg_plugin_protocol::audit::{AuditError, AuditEvent, AuditReceipt, AuditSink};
 use mcpg_plugin_protocol::backend::{BackendChunk, BackendChunkStream, CapabilitySet};
@@ -71,10 +71,7 @@ use mcpg_plugin_protocol::store::{
 use mcpg_plugin_protocol::telemetry::{
     MetricPoint, SpanEnd, SpanStart, TelemetryError, TelemetrySink,
 };
-use mcpg_plugin_protocol::transport::{
-    DispatchResponse, DispatcherError, MessageDispatcher, Transport, TransportError,
-    TransportHandle,
-};
+use mcpg_plugin_protocol::transport::{Transport, TransportError, TransportHandle};
 use mcpg_plugin_protocol::{
     BackendError, BackendPlugin, BackendRequest, BackendResponse, GateDecision,
     IdentityProviderPlugin, IdentityResolution, PluginContext, PluginManifest, ResourcePage,
@@ -902,7 +899,7 @@ pub(crate) async fn dispatch_tier1<R: Send + 'static>(
     inline_fast: bool,
     timeout: std::time::Duration,
     plugin_id: &str,
-    metric: crate::ffi_metering::FfiCall,
+    metric: crate::ffi_metering::FfiCall<'_>,
     call_vtable: impl FnOnce() -> R + Send + 'static,
     fail: impl Fn(DispatchFail) -> R,
 ) -> R {
@@ -1379,6 +1376,7 @@ pub struct NativeIdentityProviderAdapter {
     /// Fast-slot prototype (v38): typed/borrowed identity resolution. Already
     /// inline (no ferry), so this is a marshaling win only. Opt-in; default off.
     inline_fast: bool,
+    resolve_meter: crate::ffi_metering::FfiMeter,
     _host_bridge: crate::host_bridge::HostBridge,
 }
 
@@ -1467,6 +1465,11 @@ impl NativeIdentityProviderAdapter {
                 );
             }
         };
+        let resolve_meter = crate::ffi_metering::FfiMeter::new(
+            &manifest.id,
+            "identity_provider",
+            "resolve_identity",
+        );
         Ok(Self {
             library,
             vtable: vt,
@@ -1474,6 +1477,7 @@ impl NativeIdentityProviderAdapter {
             manifest,
             alias,
             inline_fast: false,
+            resolve_meter,
             _host_bridge: host_bridge,
         })
     }
@@ -1505,30 +1509,15 @@ impl IdentityProviderPlugin for NativeIdentityProviderAdapter {
         metadata: &mcpg_plugin_protocol::types::RequestMetadata,
         config: &serde_json::Value,
     ) -> IdentityResolution {
-        let headers_json: serde_json::Value = serde_json::Value::Array(
-            headers
-                .iter()
-                .map(|(k, v)| {
-                    serde_json::Value::Array(vec![
-                        serde_json::Value::String(k.clone()),
-                        serde_json::Value::String(v.clone()),
-                    ])
-                })
-                .collect(),
-        );
-        let h_str = serde_json::to_string(&headers_json).unwrap_or_else(|_| "[]".into());
+        // A `(name, value)` tuple serialises as a two-element array.
+        let h_str = serde_json::to_string(headers).unwrap_or_else(|_| "[]".into());
         let m_str = serde_json::to_string(metadata).unwrap_or_else(|_| "{}".into());
         let cfg_str = serde_json::to_string(config).unwrap_or_else(|_| "{}".into());
         let req_bytes = h_str.len() + m_str.len() + cfg_str.len();
-        let metric = crate::ffi_metering::FfiCall::begin(
-            &self.manifest.id,
-            "identity_provider",
-            "resolve_identity",
-            req_bytes,
-        );
+        let metric = self.resolve_meter.begin(req_bytes);
         let vtable_fn = self.vtable.resolve_identity;
         let handle = SendHandle(self.handle);
-        let plugin_id = self.manifest.id.clone();
+        let plugin_id = self.manifest.id.as_str();
         dispatch_tier1(
             self.inline_fast,
             self.library.ffi_limits.data_timeout,
@@ -2053,6 +2042,7 @@ pub struct NativeBackendAdapter {
     /// The audit fields of each profile, which the gateway asks for on
     /// every call; each read is a slot call off the worker.
     audit_fields: PerProfile<serde_json::Map<String, serde_json::Value>>,
+    execute_meter: crate::ffi_metering::FfiMeter,
 }
 
 unsafe impl Send for NativeBackendAdapter {}
@@ -2131,6 +2121,7 @@ impl NativeBackendAdapter {
             guard_ffi_drop(|| (vt.drop_instance)(handle));
             return Err(anyhow!("native backend plugin returned empty kind()"));
         }
+        let execute_meter = crate::ffi_metering::FfiMeter::new(&manifest.id, "backend", "execute");
         Ok(Self {
             library,
             vtable: vt,
@@ -2141,6 +2132,7 @@ impl NativeBackendAdapter {
             inline_fast: false,
             host_bridge,
             audit_fields: PerProfile::new(),
+            execute_meter,
         })
     }
 
@@ -2254,8 +2246,7 @@ impl BackendPlugin for NativeBackendAdapter {
         // `ffi_matrix` payload-scaling bench shows ms-scale at 32 KiB). The
         // span therefore covers encode → vtable → decode; response size is the
         // RString the plugin returns.
-        let call =
-            crate::ffi_metering::FfiCall::begin_no_request(&self.manifest.id, "backend", "execute");
+        let call = self.execute_meter.begin_no_request();
         let req_json = serde_json::to_string(&request).unwrap_or_default();
         call.record_request(req_json.len());
         // Run the synchronous vtable call off the async worker under the
@@ -8890,103 +8881,22 @@ impl futures_core::Stream for PublishedMessageStream {
 // Transport adapter
 // ---------------------------------------------------------------------------
 //
-// Bridges a host-provided `Arc<dyn MessageDispatcher>` onto the
-// plugin's `DispatcherCallbackRef`. The plugin's accept loop runs
-// on its own thread; per message it calls the FFI dispatch fn,
-// which block_on's the host's async dispatch and returns bytes.
-//
-// Narrowings carried from the ABI design:
-// - `DispatchResponse.stream` is not carried across. If the host
-//   dispatcher returns a streaming reply, we surface
-//   `DispatcherError::Internal { reason: "stream reply not
-//   supported across FFI" }` to the plugin.
-// - No SDK macro is shipped for transport (same narrowing pattern
-//   as http_route). Plugin authors building transport cdylibs
-//   hand-roll the extern "C" fns against the documented vtable.
+// Bridges a host-provided `Arc<dyn HttpIngressServer>` onto the
+// plugin's `HttpServerRef`. The plugin's accept loop runs on its own
+// threads; per request it calls `serve`, and the host answers through
+// the plugin's `HttpResponderRef` (see `http_ingress_bridge`).
 
 fn clone_transport(vt: &TransportVTable) -> TransportVTable {
     TransportVTable {
         make: vt.make,
         manifest_json: vt.manifest_json,
         name: vt.name,
-        start: vt.start,
+        start_http: vt.start_http,
         transport_handle_close: vt.transport_handle_close,
         transport_handle_drop: vt.transport_handle_drop,
         transport_handle_listen_address: vt.transport_handle_listen_address,
-        wire: vt.wire,
-        start_http: vt.start_http,
         shutdown: vt.shutdown,
         drop_instance: vt.drop_instance,
-    }
-}
-
-/// Host-side bridge between the plugin's `DispatcherCallbackRef`
-/// and the real `Arc<dyn MessageDispatcher>`. The plugin calls
-/// the extern "C" fn; the fn block_on's the async dispatch.
-struct DispatcherBridge {
-    dispatcher: Arc<dyn MessageDispatcher>,
-    rt: tokio::runtime::Handle,
-}
-
-extern "C" fn dispatcher_bridge_callback(
-    ctx: usize,
-    session_id: abi_stable::std_types::RString,
-    message_json: abi_stable::std_types::RString,
-) -> DispatcherCallbackResult {
-    // SAFETY: `ctx` is a `*const DispatcherBridge` leaked by the
-    // adapter's `start()`. Stays live until the transport
-    // handle's Drop frees the box.
-    let bridge = unsafe { &*(ctx as *const DispatcherBridge) };
-    #[derive(serde::Deserialize)]
-    struct MessageWire {
-        bytes: Vec<u8>,
-    }
-    let message: MessageWire = match serde_json::from_str(message_json.as_str()) {
-        Ok(m) => m,
-        Err(e) => {
-            let err = DispatcherError::InvalidMessage {
-                reason: format!("malformed dispatch message_json: {e}"),
-            };
-            return DispatcherCallbackResult {
-                reply_json: abi_stable::std_types::RString::from(
-                    serde_json::to_string(&serde_json::json!({"err": err})).unwrap_or_default(),
-                ),
-            };
-        }
-    };
-    let session = session_id.as_str().to_owned();
-    let bytes = bytes::Bytes::from(message.bytes);
-    // block_on the async dispatch. Plugin's thread blocks here
-    // until the host's pipeline returns. The rt Handle was
-    // captured at `start()` time; `block_on` works from any
-    // thread the runtime is visible from.
-    let dispatcher = Arc::clone(&bridge.dispatcher);
-    let result = bridge
-        .rt
-        .block_on(async move { dispatcher.dispatch(&session, bytes).await });
-    let reply_wire = match result {
-        Ok(DispatchResponse {
-            reply: Some(b),
-            stream: None,
-        }) => serde_json::json!({"ok": {"bytes": b.to_vec()}}),
-        Ok(DispatchResponse {
-            reply: None,
-            stream: None,
-        }) => serde_json::json!({"ok": {"bytes": Vec::<u8>::new()}}),
-        Ok(DispatchResponse {
-            stream: Some(_), ..
-        }) => {
-            let err = DispatcherError::Internal {
-                reason: "streaming reply not supported across FFI".into(),
-            };
-            serde_json::json!({"err": err})
-        }
-        Err(err) => serde_json::json!({"err": err}),
-    };
-    DispatcherCallbackResult {
-        reply_json: abi_stable::std_types::RString::from(
-            serde_json::to_string(&reply_wire).unwrap_or_default(),
-        ),
     }
 }
 
@@ -8996,7 +8906,6 @@ pub struct NativeTransportAdapter {
     handle: RPluginHandle,
     manifest: PluginManifest,
     name: String,
-    wire: mcpg_plugin_protocol::transport::TransportWire,
     #[allow(dead_code)]
     alias: String,
     _host_bridge: crate::host_bridge::HostBridge,
@@ -9069,34 +8978,22 @@ impl NativeTransportAdapter {
             return Err(anyhow!("native transport plugin returned empty name"));
         }
         let name = name_rstr.as_str().to_owned();
-        let wire_name = guard_ffi_rstring("wire", || (vt.wire)(handle));
-        let Some(wire) = mcpg_plugin_protocol::transport::TransportWire::parse(wire_name.as_str())
-        else {
-            guard_ffi_drop(|| (vt.drop_instance)(handle));
-            return Err(anyhow!(
-                "native transport plugin `{name}` declares an unknown wire {:?} \
-                 (expected \"messages\" or \"http\")",
-                wire_name.as_str()
-            ));
-        };
         Ok(Self {
             library,
             vtable: vt,
             handle,
             manifest,
             name,
-            wire,
             alias,
             _host_bridge: host_bridge,
         })
     }
 
-    /// Decode a `start` / `start_http` result into a handle; `bridge`
-    /// frees the host-side callback state when the start failed or the
-    /// handle drops.
+    /// Decode a `start_http` result into a handle; `bridge` frees the
+    /// host-side server state when the start failed or the handle drops.
     fn transport_handle_from(
         &self,
-        call: crate::ffi_metering::FfiCall,
+        call: crate::ffi_metering::FfiCall<'_>,
         result: mcpg_plugin_protocol::abi::StreamHandle,
         bridge: TransportBridge,
     ) -> Result<Box<dyn TransportHandle>, TransportError> {
@@ -9140,24 +9037,15 @@ impl NativeTransportAdapter {
     }
 }
 
-/// The host-side callback state a started transport's plugin calls into.
-enum TransportBridge {
-    Messages(*mut DispatcherBridge),
-    Http(*mut Arc<crate::http_ingress_bridge::HttpServerBridge>),
-}
+/// The host-side server state a started transport's plugin calls into.
+struct TransportBridge(*mut Arc<crate::http_ingress_bridge::HttpServerBridge>);
 
 impl TransportBridge {
     /// # Safety
-    /// The plugin no longer calls through this bridge.
+    /// The plugin makes no further calls through this bridge.
     unsafe fn release(self) {
-        match self {
-            // SAFETY: Box::into_raw'd in `start`; the caller's contract.
-            Self::Messages(ptr) => unsafe { drop(Box::from_raw(ptr)) },
-            // SAFETY: from `HttpServerBridge::into_owner`; the caller's contract.
-            Self::Http(owner) => unsafe {
-                crate::http_ingress_bridge::HttpServerBridge::release(owner);
-            },
-        }
+        // SAFETY: from `HttpServerBridge::into_owner`; the caller's contract.
+        unsafe { crate::http_ingress_bridge::HttpServerBridge::release(self.0) };
     }
 }
 
@@ -9178,62 +9066,12 @@ impl Transport for NativeTransportAdapter {
         &self.name
     }
 
-    async fn start(
-        &self,
-        listener_config: &serde_json::Value,
-        dispatcher: Arc<dyn MessageDispatcher>,
-    ) -> Result<Box<dyn TransportHandle>, TransportError> {
-        let rt = tokio::runtime::Handle::current();
-        let bridge = Box::new(DispatcherBridge { dispatcher, rt });
-        let bridge_ptr_raw = Box::into_raw(bridge);
-        let bridge_ptr = SendPtr(bridge_ptr_raw);
-        let cb = DispatcherCallbackRef {
-            ctx: bridge_ptr_raw as usize,
-            dispatch: dispatcher_bridge_callback,
-        };
-        let config_str = serde_json::to_string(listener_config).unwrap_or_else(|_| "{}".into());
-        let call = crate::ffi_metering::FfiCall::begin(
-            &self.manifest.id,
-            "transport",
-            "start",
-            config_str.len(),
-        );
-        let config_json = abi_stable::std_types::RString::from(config_str);
-        let vtable_fn = self.vtable.start;
-        let handle = SendHandle(self.handle);
-        let plugin_id = self.manifest.id.clone();
-        let spawn_result =
-            tokio::task::spawn_blocking(move || vtable_fn(handle.ptr(), config_json, cb)).await;
-        let bridge = TransportBridge::Messages(bridge_ptr.0);
-        let Ok(result) = spawn_result else {
-            call.end_err(0);
-            // SAFETY: start panicked, so the plugin holds no reference.
-            unsafe { bridge.release() };
-            return Err(TransportError::Io {
-                reason: format!("native plugin '{plugin_id}' panicked during start"),
-            });
-        };
-        self.transport_handle_from(call, result, bridge)
-    }
-
-    fn wire(&self) -> mcpg_plugin_protocol::transport::TransportWire {
-        self.wire
-    }
-
     async fn start_http(
         &self,
         listener_config: &serde_json::Value,
         server: Arc<dyn mcpg_plugin_protocol::transport::HttpIngressServer>,
     ) -> Result<Box<dyn TransportHandle>, TransportError> {
         use crate::http_ingress_bridge::HttpServerBridge;
-        if self.wire != mcpg_plugin_protocol::transport::TransportWire::Http {
-            return Err(TransportError::InvalidConfig {
-                message: format!(
-                    "transport `{}` hands the gateway JSON-RPC messages, not HTTP requests",
-                    self.name
-                ),
-            });
-        }
         let keepalive: Arc<dyn std::any::Any + Send + Sync> = Arc::clone(&self.library) as _;
         let owner = HttpServerBridge::into_owner(HttpServerBridge::new(
             server,
@@ -9256,7 +9094,7 @@ impl Transport for NativeTransportAdapter {
         let spawn_result =
             tokio::task::spawn_blocking(move || vtable_fn(handle.ptr(), config_json, server_ref))
                 .await;
-        let bridge = TransportBridge::Http(owner_ptr.0);
+        let bridge = TransportBridge(owner_ptr.0);
         let Ok(result) = spawn_result else {
             call.end_err(0);
             // SAFETY: start_http panicked, so the plugin holds no reference.
@@ -9290,7 +9128,7 @@ unsafe impl Sync for NativeTransportHandle {}
 #[async_trait]
 impl TransportHandle for NativeTransportHandle {
     async fn listen_address(&self) -> Option<String> {
-        // Cheap path: use cached value populated at start(). If
+        // Cheap path: use cached value populated at start_http(). If
         // caller wants fresh, we call into the plugin.
         if let Ok(guard) = self.cached_listen_address.lock()
             && guard.is_some()
@@ -9369,6 +9207,19 @@ mod tests {
         });
         assert_eq!(overtaken, Some(2));
         assert_eq!(values.get_or_read("p", || Some(3)), Some(3));
+    }
+
+    /// The identity slot receives the header list as `[["name","value"],…]`.
+    #[test]
+    fn a_header_list_serialises_as_name_value_arrays() {
+        let headers = vec![
+            ("authorization".to_owned(), "Bearer a\"b".to_owned()),
+            ("x-empty".to_owned(), String::new()),
+        ];
+        assert_eq!(
+            serde_json::to_string(headers.as_slice()).unwrap(),
+            r#"[["authorization","Bearer a\"b"],["x-empty",""]]"#
+        );
     }
 
     // A panic inside a foreign cdylib's lifecycle slot must be caught
