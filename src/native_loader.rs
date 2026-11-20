@@ -17,10 +17,13 @@
 //! 2. **ABI version sentinel** — the loader aborts if the cdylib's
 //!    `abi_version` does not match the host's compiled-in
 //!    [`MCPG_PLUGIN_ABI_VERSION`].
-//! 3. **Library lifetime** — the `Library` handle is kept alive inside
-//!    the plugin adapter; dropping the adapter unloads the library.
-//!    Plugin handles returned by `make` MUST only be used while the
-//!    owning [`LoadedNativePlugin`] is alive.
+//! 3. **Instance lifetime** — each plugin instance is owned by a
+//!    `NativeInstance`, which also holds the instance's host bridge and
+//!    the [`LoadedNativePlugin`] whose `Library` maps its slots. The
+//!    adapter, every call ferried to a blocking thread, and every stream,
+//!    watch, lease or transport handle made from the instance hold an
+//!    `Arc` of it, so the instance is destroyed, and the library can
+//!    unload, only after the last of them is gone.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -203,17 +206,17 @@ fn enforce_ffi_payload_cap(
     Ok(())
 }
 
-/// Wrapper to transport `RPluginHandle` (`*mut ()`) across the
-/// `spawn_blocking` boundary. Safety contract: the raw pointer is owned by the
-/// `NativeToolGateAdapter` which is already `unsafe impl Send + Sync` and keeps
-/// the backing `Library` alive via `Arc<LoadedNativePlugin>`. The handle is only
-/// used inside `spawn_blocking` closures that run to completion before the adapter
-/// can be dropped, so the pointer remains valid for the duration of use.
+/// A bare `RPluginHandle` (`*mut ()`) that can cross into a
+/// `spawn_blocking` closure. It owns nothing: whoever builds one keeps the
+/// instance and its library alive until the closure has returned. A ferried
+/// call that times out goes on running on its blocking thread after the
+/// caller's future has completed, so the end of the future is not the end of
+/// the call. The adapters ferry an `Arc<NativeInstance>` instead, which holds
+/// the instance until the slot returns.
 ///
-/// Made `pub` to support the `http_route_adapter_seam`
-/// integration test, which exercises
-/// [`dispatch_http_route_via_vtable`] without constructing a full
-/// [`LoadedNativePlugin`].
+/// Made `pub` for the adapter seam integration tests, which drive
+/// [`dispatch_http_route_via_vtable`] and the other `dispatch_*_via_vtable`
+/// helpers with in-process slots and no [`LoadedNativePlugin`].
 pub struct SendHandle(RPluginHandle);
 unsafe impl Send for SendHandle {}
 unsafe impl Sync for SendHandle {}
@@ -224,6 +227,114 @@ impl SendHandle {
     pub fn ptr(&self) -> RPluginHandle {
         self.0
     }
+}
+
+/// What a call ferried to a blocking thread holds there to reach its plugin
+/// instance. An `Arc<NativeInstance>` keeps the instance and its library
+/// alive until the slot returns; a [`SendHandle`] keeps nothing alive.
+pub trait FerryHandle: Send + 'static {
+    /// The instance handle the slot takes.
+    fn ptr(&self) -> RPluginHandle;
+}
+
+impl FerryHandle for SendHandle {
+    fn ptr(&self) -> RPluginHandle {
+        self.0
+    }
+}
+
+/// One plugin instance: the handle its `make` slot returned, the host bridge
+/// the plugin calls back through, and the library its slots live in.
+///
+/// The adapter holds it in an `Arc`, and so does every call ferried to a
+/// blocking thread and every stream, watch, lease or transport handle made
+/// from the instance. The instance is destroyed when the last of them drops,
+/// so a slot still running after its caller stopped waiting never runs on a
+/// destroyed instance or an unloaded library.
+pub(crate) struct NativeInstance {
+    handle: RPluginHandle,
+    drop_instance: extern "C" fn(RPluginHandle),
+    /// Runs before `drop_instance`, for a kind that flushes on teardown.
+    shutdown_on_drop: Option<extern "C" fn(RPluginHandle)>,
+    host_bridge: crate::host_bridge::HostBridge,
+    /// Declared last: fields drop in order, so the library unloads after
+    /// `drop` has destroyed the instance and after the bridge.
+    _library: Arc<LoadedNativePlugin>,
+}
+
+// SAFETY: the plugin's slots accept the handle from any thread (a plugin
+// that is not thread-safe guards itself), and only `drop` destroys it.
+unsafe impl Send for NativeInstance {}
+unsafe impl Sync for NativeInstance {}
+
+impl NativeInstance {
+    fn new(
+        library: Arc<LoadedNativePlugin>,
+        handle: RPluginHandle,
+        drop_instance: extern "C" fn(RPluginHandle),
+        host_bridge: crate::host_bridge::HostBridge,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            handle,
+            drop_instance,
+            shutdown_on_drop: None,
+            host_bridge,
+            _library: library,
+        })
+    }
+
+    /// As [`Self::new`], with `shutdown` run before `drop_instance`.
+    fn with_shutdown(
+        library: Arc<LoadedNativePlugin>,
+        handle: RPluginHandle,
+        shutdown: extern "C" fn(RPluginHandle),
+        drop_instance: extern "C" fn(RPluginHandle),
+        host_bridge: crate::host_bridge::HostBridge,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            handle,
+            drop_instance,
+            shutdown_on_drop: Some(shutdown),
+            host_bridge,
+            _library: library,
+        })
+    }
+
+    fn host_bridge(&self) -> &crate::host_bridge::HostBridge {
+        &self.host_bridge
+    }
+}
+
+impl FerryHandle for Arc<NativeInstance> {
+    fn ptr(&self) -> RPluginHandle {
+        self.handle
+    }
+}
+
+impl Drop for NativeInstance {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown_on_drop {
+            guard_ffi_drop(|| shutdown(self.handle));
+        }
+        guard_ffi_drop(|| (self.drop_instance)(self.handle));
+    }
+}
+
+/// Run `call` on a blocking thread, with the handle `held` gives it.
+///
+/// The blocking task owns `held` until the slot returns, also after the
+/// caller has stopped waiting (a timeout, a dropped request). An output that
+/// nobody waits for drops before `held`: it can own memory that only the
+/// plugin's library frees.
+fn ferry<H: FerryHandle, R: Send + 'static>(
+    held: H,
+    call: impl FnOnce(RPluginHandle) -> R + Send + 'static,
+) -> impl std::future::Future<Output = Result<R, tokio::task::JoinError>> + Send + 'static {
+    let task = tokio::task::spawn_blocking(move || {
+        let out = call(held.ptr());
+        (out, held)
+    });
+    async move { task.await.map(|(out, _held)| out) }
 }
 
 /// Generic Send/Sync wrapper for a raw pointer the adapter needs
@@ -883,13 +994,14 @@ pub(crate) enum DispatchFail {
 /// Run one Tier-1 vtable call under the chosen dispatch policy (v38).
 ///
 /// `call_vtable` owns its captured args (`RPluginContext`, the JSON `String`s,
-/// the handle, the fn pointer) and produces the typed result `R` by reborrowing
-/// its owned strings as `RStr` *inside* itself — so it is `Send + 'static` and
-/// works in **both** modes:
+/// the fn pointer), takes the instance handle as its argument, and produces the
+/// typed result `R` by reborrowing its owned strings as `RStr` *inside* itself —
+/// so it is `Send + 'static` and works in **both** modes:
 /// - **inline** (`inline_fast`, operator-trusted): call it directly — zero-copy,
 ///   no thread hop, no timeout (~33×). A hung plugin wedges this worker.
-/// - **ferried** (default): `spawn_blocking` + per-call timeout — a hung/slow
-///   plugin can't freeze the runtime. The owned strings ride into the closure.
+/// - **ferried** (default): [`ferry`] + per-call timeout — a hung/slow
+///   plugin can't freeze the runtime. The owned strings and an `Arc` of
+///   `instance` ride into the closure.
 ///
 /// `fail` maps a ferried failure to the slot's typed fallback (e.g. `Deny`).
 /// Panics at the FFI boundary are already caught by the plugin's `catch_panic_*`
@@ -897,18 +1009,19 @@ pub(crate) enum DispatchFail {
 /// JoinError (which shouldn't happen given the wrapper, but fails closed).
 pub(crate) async fn dispatch_tier1<R: Send + 'static>(
     inline_fast: bool,
+    instance: &Arc<NativeInstance>,
     timeout: std::time::Duration,
     plugin_id: &str,
     metric: crate::ffi_metering::FfiCall<'_>,
-    call_vtable: impl FnOnce() -> R + Send + 'static,
+    call_vtable: impl FnOnce(RPluginHandle) -> R + Send + 'static,
     fail: impl Fn(DispatchFail) -> R,
 ) -> R {
     if inline_fast {
-        let r = call_vtable();
+        let r = call_vtable(instance.ptr());
         metric.end_ok(0);
         return r;
     }
-    match tokio::time::timeout(timeout, tokio::task::spawn_blocking(call_vtable)).await {
+    match tokio::time::timeout(timeout, ferry(Arc::clone(instance), call_vtable)).await {
         Ok(Ok(r)) => {
             metric.end_ok(0);
             r
@@ -933,7 +1046,7 @@ pub(crate) async fn dispatch_tier1<R: Send + 'static>(
 pub struct NativeToolGateAdapter {
     library: Arc<LoadedNativePlugin>,
     vtable: ToolGateVTable,
-    handle: RPluginHandle,
+    instance: Arc<NativeInstance>,
     manifest: PluginManifest,
     /// Operator alias for this plugin entry — stable through the
     /// adapter's lifetime; surfaced to the plugin via the
@@ -947,7 +1060,6 @@ pub struct NativeToolGateAdapter {
     /// deployment config; defaults to `false` (the ferried path). See
     /// [`Self::set_inline_fast`].
     inline_fast: bool,
-    _host_bridge: crate::host_bridge::HostBridge,
 }
 
 // Safety: the plugin's FFI surface is expected to be thread-safe
@@ -1020,14 +1132,15 @@ impl NativeToolGateAdapter {
                 );
             }
         };
+        let instance =
+            NativeInstance::new(Arc::clone(&library), handle, vt.drop_instance, host_bridge);
         Ok(Self {
             library,
             vtable: vt,
-            handle,
+            instance,
             manifest,
             alias,
             inline_fast: false,
-            _host_bridge: host_bridge,
         })
     }
 
@@ -1040,15 +1153,6 @@ impl NativeToolGateAdapter {
     /// operator opt-in.
     pub fn set_inline_fast(&mut self, enabled: bool) {
         self.inline_fast = enabled;
-    }
-}
-
-impl Drop for NativeToolGateAdapter {
-    fn drop(&mut self) {
-        guard_ffi_drop(|| (self.vtable.drop_instance)(self.handle));
-        // Library unloads when the last Arc is dropped; keep `library`
-        // alive at least until our handle is released.
-        let _ = &self.library;
     }
 }
 
@@ -1082,21 +1186,21 @@ impl ToolGatePlugin for NativeToolGateAdapter {
             req_bytes,
         );
         let vtable_fn = self.vtable.evaluate_pre_dispatch;
-        let handle = SendHandle(self.handle);
         let plugin_id = self.manifest.id.clone();
         dispatch_tier1(
             self.inline_fast,
+            &self.instance,
             self.library.ffi_limits.data_timeout,
             &self.manifest.id,
             metric,
-            move || -> GateDecision {
+            move |handle| -> GateDecision {
                 let args = abi_stable::std_types::RStr::from(args_str.as_str());
                 let meta_r: abi_stable::std_types::ROption<abi_stable::std_types::RStr> = meta_str
                     .as_deref()
                     .map(abi_stable::std_types::RStr::from)
                     .into();
                 let cfg = abi_stable::std_types::RStr::from(cfg_str.as_str());
-                vtable_fn(handle.ptr(), r_ctx, args, meta_r, cfg).into()
+                vtable_fn(handle, r_ctx, args, meta_r, cfg).into()
             },
             move |f| GateDecision::Deny {
                 http_status: match f {
@@ -1134,19 +1238,19 @@ impl ToolGatePlugin for NativeToolGateAdapter {
             req_bytes,
         );
         let vtable_fn = self.vtable.evaluate_post_dispatch;
-        let handle = SendHandle(self.handle);
         let plugin_id = self.manifest.id.clone();
         let dur = execution_duration_ms;
         dispatch_tier1(
             self.inline_fast,
+            &self.instance,
             self.library.ffi_limits.data_timeout,
             &self.manifest.id,
             metric,
-            move || -> GateDecision {
+            move |handle| -> GateDecision {
                 let args = abi_stable::std_types::RStr::from(args_str.as_str());
                 let res = abi_stable::std_types::RStr::from(res_str.as_str());
                 let cfg = abi_stable::std_types::RStr::from(cfg_str.as_str());
-                vtable_fn(handle.ptr(), r_ctx, args, res, dur, cfg).into()
+                vtable_fn(handle, r_ctx, args, res, dur, cfg).into()
             },
             move |f| GateDecision::Deny {
                 http_status: match f {
@@ -1165,7 +1269,7 @@ impl ToolGatePlugin for NativeToolGateAdapter {
     }
 
     async fn shutdown(&self) {
-        guard_ffi_drop(|| (self.vtable.shutdown)(self.handle));
+        guard_ffi_drop(|| (self.vtable.shutdown)(self.instance.ptr()));
     }
 }
 
@@ -1173,14 +1277,13 @@ impl ToolGatePlugin for NativeToolGateAdapter {
 pub struct NativeTransformAdapter {
     library: Arc<LoadedNativePlugin>,
     vtable: TransformVTable,
-    handle: RPluginHandle,
+    instance: Arc<NativeInstance>,
     manifest: PluginManifest,
     #[allow(dead_code)]
     alias: String,
     /// Fast-slot prototype (v38): inline + typed/borrowed transforms. Operator
     /// trust opt-in; default false. See [`NativeToolGateAdapter::set_inline_fast`].
     inline_fast: bool,
-    _host_bridge: crate::host_bridge::HostBridge,
 }
 
 unsafe impl Send for NativeTransformAdapter {}
@@ -1250,14 +1353,15 @@ impl NativeTransformAdapter {
                 );
             }
         };
+        let instance =
+            NativeInstance::new(Arc::clone(&library), handle, vt.drop_instance, host_bridge);
         Ok(Self {
             library,
             vtable: vt,
-            handle,
+            instance,
             manifest,
             alias,
             inline_fast: false,
-            _host_bridge: host_bridge,
         })
     }
 
@@ -1265,13 +1369,6 @@ impl NativeTransformAdapter {
     /// [`NativeToolGateAdapter::set_inline_fast`] for the trust contract.
     pub fn set_inline_fast(&mut self, enabled: bool) {
         self.inline_fast = enabled;
-    }
-}
-
-impl Drop for NativeTransformAdapter {
-    fn drop(&mut self) {
-        guard_ffi_drop(|| (self.vtable.drop_instance)(self.handle));
-        let _ = &self.library;
     }
 }
 
@@ -1298,17 +1395,17 @@ impl TransformPlugin for NativeTransformAdapter {
             req_bytes,
         );
         let vtable_fn = self.vtable.transform_arguments;
-        let handle = SendHandle(self.handle);
         let plugin_id = self.manifest.id.clone();
         dispatch_tier1(
             self.inline_fast,
+            &self.instance,
             self.library.ffi_limits.data_timeout,
             &self.manifest.id,
             metric,
-            move || -> TransformResult {
+            move |handle| -> TransformResult {
                 let args = abi_stable::std_types::RStr::from(args_str.as_str());
                 let cfg = abi_stable::std_types::RStr::from(cfg_str.as_str());
-                vtable_fn(handle.ptr(), r_ctx, args, cfg).into()
+                vtable_fn(handle, r_ctx, args, cfg).into()
             },
             move |f| TransformResult::Error {
                 message: match f {
@@ -1337,17 +1434,17 @@ impl TransformPlugin for NativeTransformAdapter {
             req_bytes,
         );
         let vtable_fn = self.vtable.transform_result;
-        let handle = SendHandle(self.handle);
         let plugin_id = self.manifest.id.clone();
         dispatch_tier1(
             self.inline_fast,
+            &self.instance,
             self.library.ffi_limits.data_timeout,
             &self.manifest.id,
             metric,
-            move || -> TransformResult {
+            move |handle| -> TransformResult {
                 let res = abi_stable::std_types::RStr::from(res_str.as_str());
                 let cfg = abi_stable::std_types::RStr::from(cfg_str.as_str());
-                vtable_fn(handle.ptr(), r_ctx, res, cfg).into()
+                vtable_fn(handle, r_ctx, res, cfg).into()
             },
             move |f| TransformResult::Error {
                 message: match f {
@@ -1361,7 +1458,7 @@ impl TransformPlugin for NativeTransformAdapter {
 
     /// Forwards to the cdylib's `TransformVTable::shutdown` function pointer.
     async fn shutdown(&self) {
-        guard_ffi_drop(|| (self.vtable.shutdown)(self.handle));
+        guard_ffi_drop(|| (self.vtable.shutdown)(self.instance.ptr()));
     }
 }
 
@@ -1369,7 +1466,7 @@ impl TransformPlugin for NativeTransformAdapter {
 pub struct NativeIdentityProviderAdapter {
     library: Arc<LoadedNativePlugin>,
     vtable: IdentityProviderVTable,
-    handle: RPluginHandle,
+    instance: Arc<NativeInstance>,
     manifest: PluginManifest,
     #[allow(dead_code)]
     alias: String,
@@ -1377,7 +1474,6 @@ pub struct NativeIdentityProviderAdapter {
     /// inline (no ferry), so this is a marshaling win only. Opt-in; default off.
     inline_fast: bool,
     resolve_meter: crate::ffi_metering::FfiMeter,
-    _host_bridge: crate::host_bridge::HostBridge,
 }
 
 unsafe impl Send for NativeIdentityProviderAdapter {}
@@ -1470,15 +1566,16 @@ impl NativeIdentityProviderAdapter {
             "identity_provider",
             "resolve_identity",
         );
+        let instance =
+            NativeInstance::new(Arc::clone(&library), handle, vt.drop_instance, host_bridge);
         Ok(Self {
             library,
             vtable: vt,
-            handle,
+            instance,
             manifest,
             alias,
             inline_fast: false,
             resolve_meter,
-            _host_bridge: host_bridge,
         })
     }
 
@@ -1487,13 +1584,6 @@ impl NativeIdentityProviderAdapter {
     /// providers doing network JWKS/OIDC work should NOT be opted in.)
     pub fn set_inline_fast(&mut self, enabled: bool) {
         self.inline_fast = enabled;
-    }
-}
-
-impl Drop for NativeIdentityProviderAdapter {
-    fn drop(&mut self) {
-        guard_ffi_drop(|| (self.vtable.drop_instance)(self.handle));
-        let _ = &self.library;
     }
 }
 
@@ -1516,18 +1606,18 @@ impl IdentityProviderPlugin for NativeIdentityProviderAdapter {
         let req_bytes = h_str.len() + m_str.len() + cfg_str.len();
         let metric = self.resolve_meter.begin(req_bytes);
         let vtable_fn = self.vtable.resolve_identity;
-        let handle = SendHandle(self.handle);
         let plugin_id = self.manifest.id.as_str();
         dispatch_tier1(
             self.inline_fast,
+            &self.instance,
             self.library.ffi_limits.data_timeout,
             &self.manifest.id,
             metric,
-            move || -> IdentityResolution {
+            move |handle| -> IdentityResolution {
                 let h = abi_stable::std_types::RStr::from(h_str.as_str());
                 let m = abi_stable::std_types::RStr::from(m_str.as_str());
                 let cfg = abi_stable::std_types::RStr::from(cfg_str.as_str());
-                vtable_fn(handle.ptr(), h, m, cfg).into()
+                vtable_fn(handle, h, m, cfg).into()
             },
             // Fail closed: a timed-out / panicked resolver yields no identity.
             move |f| IdentityResolution::Invalid {
@@ -1631,24 +1721,18 @@ fn clone_content_store(vt: &ContentStoreVTable) -> ContentStoreVTable {
 // content_store adapter (factory + per-profile handle)
 // ---------------------------------------------------------------------------
 
-/// Owns the loaded cdylib's `content_store` instance handle. Shared
+/// The loaded cdylib's `content_store` instance with its vtable. Shared
 /// (`Arc`) between the [`NativeContentStorePlugin`] factory and every
-/// [`NativeContentStoreProfile`] it hands out, so the cdylib `make`
-/// instance lives until the factory AND all profiles drop — at which
-/// point `shutdown` + `drop_instance` fire exactly once.
+/// [`NativeContentStoreProfile`] it hands out. Its `NativeInstance` runs
+/// `shutdown` + `drop_instance` exactly once, after the factory, every
+/// profile and every in-flight call have dropped it.
 struct NativeContentStoreInstance {
     library: Arc<LoadedNativePlugin>,
     vtable: ContentStoreVTable,
-    handle: RPluginHandle,
+    instance: Arc<NativeInstance>,
     manifest: PluginManifest,
     kind: String,
-    _host_bridge: crate::host_bridge::HostBridge,
 }
-
-// SAFETY: same contract as the other native adapters — the cdylib's
-// instance is internally synchronised; the host serialises lifecycle.
-unsafe impl Send for NativeContentStoreInstance {}
-unsafe impl Sync for NativeContentStoreInstance {}
 
 impl NativeContentStoreInstance {
     /// Invoke an enveloped vtable slot: serialise `args`, call the fn,
@@ -1674,11 +1758,11 @@ impl NativeContentStoreInstance {
         // backstop: every caller is an `async fn` whose body is this one
         // blocking FFI call, so it never yields and a slow or hung store
         // would pin a tokio worker uncancellably.
-        let handle = SendHandle::new(self.handle);
         let payload = abi_stable::std_types::RString::from(args_json);
         let out = call_sync_vtable_bounded(
+            &self.instance,
             self.library.ffi_limits.data_timeout,
-            move || vtable_fn(handle.ptr(), payload),
+            move |handle| vtable_fn(handle, payload),
             abi_stable::std_types::RString::new,
         );
         let resp_bytes = out.len();
@@ -1741,25 +1825,14 @@ impl NativeContentStoreInstance {
         let args_json = serde_json::to_string(&args).unwrap_or_default();
         // Bounded like `call_enveloped`; a failed call degrades to
         // `T::default()`, which is already this slot's contract.
-        let handle = SendHandle::new(self.handle);
         let payload = abi_stable::std_types::RString::from(args_json);
         let out = call_sync_vtable_bounded(
+            &self.instance,
             self.library.ffi_limits.data_timeout,
-            move || vtable_fn(handle.ptr(), payload),
+            move |handle| vtable_fn(handle, payload),
             abi_stable::std_types::RString::new,
         );
         serde_json::from_str(out.as_str()).unwrap_or_default()
-    }
-}
-
-impl Drop for NativeContentStoreInstance {
-    fn drop(&mut self) {
-        // Graceful FFI teardown: flush via `shutdown`, then reclaim the
-        // boxed instance. Fires once, when the factory and all profiles
-        // have been dropped (Arc refcount → 0).
-        guard_ffi_drop(|| (self.vtable.shutdown)(self.handle));
-        guard_ffi_drop(|| (self.vtable.drop_instance)(self.handle));
-        let _ = &self.library;
     }
 }
 
@@ -1848,14 +1921,21 @@ impl NativeContentStorePlugin {
             guard_ffi_drop(|| (vt.drop_instance)(handle));
             return Err(anyhow!("native content_store plugin returned empty kind()"));
         }
+        // Teardown flushes through `shutdown` before reclaiming the instance.
+        let instance = NativeInstance::with_shutdown(
+            Arc::clone(&library),
+            handle,
+            vt.shutdown,
+            vt.drop_instance,
+            host_bridge,
+        );
         Ok(Self {
             inner: Arc::new(NativeContentStoreInstance {
                 library,
                 vtable: vt,
-                handle,
+                instance,
                 manifest,
                 kind,
-                _host_bridge: host_bridge,
             }),
         })
     }
@@ -2023,7 +2103,7 @@ impl<T: Clone> PerProfile<T> {
 pub struct NativeBackendAdapter {
     library: Arc<LoadedNativePlugin>,
     vtable: BackendVTable,
-    handle: RPluginHandle,
+    instance: Arc<NativeInstance>,
     manifest: PluginManifest,
     kind: String,
     #[allow(dead_code)]
@@ -2038,7 +2118,6 @@ pub struct NativeBackendAdapter {
     /// this worker); set from deployment config, defaults to `false` (the
     /// ferried path). Mirrors [`NativeToolGateAdapter::set_inline_fast`].
     inline_fast: bool,
-    host_bridge: crate::host_bridge::HostBridge,
     /// The audit fields of each profile, which the gateway asks for on
     /// every call; each read is a slot call off the worker.
     audit_fields: PerProfile<serde_json::Map<String, serde_json::Value>>,
@@ -2122,15 +2201,16 @@ impl NativeBackendAdapter {
             return Err(anyhow!("native backend plugin returned empty kind()"));
         }
         let execute_meter = crate::ffi_metering::FfiMeter::new(&manifest.id, "backend", "execute");
+        let instance =
+            NativeInstance::new(Arc::clone(&library), handle, vt.drop_instance, host_bridge);
         Ok(Self {
             library,
             vtable: vt,
-            handle,
+            instance,
             manifest,
             kind,
             alias,
             inline_fast: false,
-            host_bridge,
             audit_fields: PerProfile::new(),
             execute_meter,
         })
@@ -2140,13 +2220,6 @@ impl NativeBackendAdapter {
     /// [`inline_fast`](Self::inline_fast) field for the trust contract.
     pub fn set_inline_fast(&mut self, enabled: bool) {
         self.inline_fast = enabled;
-    }
-}
-
-impl Drop for NativeBackendAdapter {
-    fn drop(&mut self) {
-        guard_ffi_drop(|| (self.vtable.drop_instance)(self.handle));
-        let _ = &self.library;
     }
 }
 
@@ -2187,12 +2260,12 @@ impl BackendPlugin for NativeBackendAdapter {
         // decodes to a transport-class error below, so a panic or timeout
         // surfaces as a failed registration rather than a wedged worker.
         let vtable_fn = self.vtable.register_profile;
-        let handle = SendHandle(self.handle);
         let name = abi_stable::std_types::RString::from(backend_name);
         let spec_arg = abi_stable::std_types::RString::from(spec_json);
         let out = call_sync_vtable_bounded(
+            &self.instance,
             self.library.ffi_limits.data_timeout,
-            move || vtable_fn(handle.ptr(), name, spec_arg),
+            move |handle| vtable_fn(handle, name, spec_arg),
             abi_stable::std_types::RString::new,
         );
         // Also after a failed registration: the plugin may hold part of it.
@@ -2238,14 +2311,13 @@ impl BackendPlugin for NativeBackendAdapter {
         let _dispatch = request
             .identity
             .as_mut()
-            .map(|id| self.host_bridge.begin_dispatch(id));
+            .map(|id| self.instance.host_bridge().begin_dispatch(id));
         // Measure host→plugin call duration + payload sizes.
-        // Start the clock BEFORE the request encode: `request.payload` is a
-        // `Vec<u8>` that serialises as a JSON number-array, so for large
-        // payloads the encode is a real chunk of the FFI boundary cost (the
-        // `ffi_matrix` payload-scaling bench shows ms-scale at 32 KiB). The
-        // span therefore covers encode → vtable → decode; response size is the
-        // RString the plugin returns.
+        // Start the clock BEFORE the request encode: the encode writes
+        // `request.payload` as one base64 string (`payload_b64` in the
+        // protocol's `backend.rs`), so its cost grows with the payload and is
+        // part of the FFI boundary cost. The span therefore covers encode →
+        // vtable → decode; response size is the RString the plugin returns.
         let call = self.execute_meter.begin_no_request();
         let req_json = serde_json::to_string(&request).unwrap_or_default();
         call.record_request(req_json.len());
@@ -2254,7 +2326,6 @@ impl BackendPlugin for NativeBackendAdapter {
         // cannot pin a tokio worker indefinitely (matching http_route /
         // notify / execute_streaming).
         let vtable_fn = self.vtable.execute;
-        let handle = SendHandle(self.handle);
         let name = abi_stable::std_types::RString::from(backend_name);
         let req = abi_stable::std_types::RString::from(req_json);
         let out = if self.inline_fast {
@@ -2265,7 +2336,7 @@ impl BackendPlugin for NativeBackendAdapter {
             // unwinding); a hung/blocking backend wedges this worker (the
             // trust contract). This resolves on the first poll, letting the
             // sync dispatch bridge skip `block_in_place`.
-            vtable_fn(handle.ptr(), name, req)
+            vtable_fn(self.instance.ptr(), name, req)
         } else {
             // Run the synchronous vtable call off the async worker under the
             // per-plugin data timeout, so a slow / hung / panicking backend
@@ -2274,7 +2345,9 @@ impl BackendPlugin for NativeBackendAdapter {
             let data_timeout = self.library.ffi_limits.data_timeout;
             match tokio::time::timeout(
                 data_timeout,
-                tokio::task::spawn_blocking(move || vtable_fn(handle.ptr(), name, req)),
+                ferry(Arc::clone(&self.instance), move |handle| {
+                    vtable_fn(handle, name, req)
+                }),
             )
             .await
             {
@@ -2362,7 +2435,7 @@ impl BackendPlugin for NativeBackendAdapter {
         let dispatch = request
             .identity
             .as_mut()
-            .map(|id| self.host_bridge.begin_dispatch(id));
+            .map(|id| self.instance.host_bridge().begin_dispatch(id));
         let (bridge_ptr_raw, sink, rx) = make_stream_bridge(&self.manifest.id);
         let bridge_ptr = SendPtr(bridge_ptr_raw);
         let req_json = abi_stable::std_types::RString::from(
@@ -2370,11 +2443,11 @@ impl BackendPlugin for NativeBackendAdapter {
         );
         let name = abi_stable::std_types::RString::from(backend_name);
         let vtable_fn = self.vtable.execute_streaming;
-        let handle = SendHandle(self.handle);
         let plugin_id = self.manifest.id.clone();
-        let spawn_result =
-            tokio::task::spawn_blocking(move || vtable_fn(handle.ptr(), name, req_json, sink))
-                .await;
+        let spawn_result = ferry(Arc::clone(&self.instance), move |handle| {
+            vtable_fn(handle, name, req_json, sink)
+        })
+        .await;
         let result = match spawn_result {
             Ok(r) => r,
             Err(_) => {
@@ -2405,9 +2478,8 @@ impl BackendPlugin for NativeBackendAdapter {
             return Err(err);
         }
         let guard = StreamCancelGuard {
-            library: Arc::clone(&self.library),
+            instance: Arc::clone(&self.instance),
             cancel_fn: self.vtable.cancel_stream,
-            plugin_handle: self.handle,
             watch_handle: result.handle,
             bridge_ptr: bridge_ptr.0,
         };
@@ -2438,16 +2510,17 @@ impl BackendPlugin for NativeBackendAdapter {
         // a slow / hung / panicking backend must surface as an error rather than
         // pin a tokio worker indefinitely.
         let vtable_fn = self.vtable.execute_transaction;
-        let handle = SendHandle(self.handle);
         let name = abi_stable::std_types::RString::from(backend_name);
         let tx = abi_stable::std_types::RString::from(tx_json);
         let out = if self.inline_fast {
-            vtable_fn(handle.ptr(), name, tx)
+            vtable_fn(self.instance.ptr(), name, tx)
         } else {
             let data_timeout = self.library.ffi_limits.data_timeout;
             match tokio::time::timeout(
                 data_timeout,
-                tokio::task::spawn_blocking(move || vtable_fn(handle.ptr(), name, tx)),
+                ferry(Arc::clone(&self.instance), move |handle| {
+                    vtable_fn(handle, name, tx)
+                }),
             )
             .await
             {
@@ -2516,11 +2589,11 @@ impl BackendPlugin for NativeBackendAdapter {
 
     fn input_schema(&self, backend_name: &str) -> Option<serde_json::Value> {
         let vtable_fn = self.vtable.input_schema_json;
-        let handle = SendHandle(self.handle);
         let name = abi_stable::std_types::RString::from(backend_name);
         let out = call_sync_vtable_bounded(
+            &self.instance,
             self.library.ffi_limits.data_timeout,
-            move || vtable_fn(handle.ptr(), name),
+            move |handle| vtable_fn(handle, name),
             || abi_stable::std_types::ROption::RNone,
         );
         match out.into_option() {
@@ -2543,11 +2616,11 @@ impl BackendPlugin for NativeBackendAdapter {
 
     fn output_schema(&self, backend_name: &str) -> Option<serde_json::Value> {
         let vtable_fn = self.vtable.output_schema_json;
-        let handle = SendHandle(self.handle);
         let name = abi_stable::std_types::RString::from(backend_name);
         let out = call_sync_vtable_bounded(
+            &self.instance,
             self.library.ffi_limits.data_timeout,
-            move || vtable_fn(handle.ptr(), name),
+            move |handle| vtable_fn(handle, name),
             || abi_stable::std_types::ROption::RNone,
         );
         match out.into_option() {
@@ -2586,11 +2659,11 @@ impl BackendPlugin for NativeBackendAdapter {
         // this `async fn` body is one blocking FFI call and never yields,
         // so a caller-side `timeout` around it cannot fire.
         let vtable_fn = self.vtable.list_resources;
-        let handle = SendHandle(self.handle);
         let name = abi_stable::std_types::RString::from(backend_name);
         let out = call_sync_vtable_bounded(
+            &self.instance,
             self.library.ffi_limits.data_timeout,
-            move || vtable_fn(handle.ptr(), name, cursor_opt),
+            move |handle| vtable_fn(handle, name, cursor_opt),
             abi_stable::std_types::RString::new,
         );
         let resp_bytes = out.len();
@@ -2656,11 +2729,11 @@ impl BackendPlugin for NativeBackendAdapter {
         self.audit_fields
             .get_or_read(backend_name, || {
                 let vtable_fn = self.vtable.audit_metadata;
-                let handle = SendHandle(self.handle);
                 let name = abi_stable::std_types::RString::from(backend_name);
                 let out = call_sync_vtable_bounded(
+                    &self.instance,
                     self.library.ffi_limits.data_timeout,
-                    move || vtable_fn(handle.ptr(), name),
+                    move |handle| vtable_fn(handle, name),
                     abi_stable::std_types::RString::new,
                 );
                 match serde_json::from_str::<serde_json::Value>(out.as_str()) {
@@ -2683,10 +2756,10 @@ impl BackendPlugin for NativeBackendAdapter {
         );
         // Bounded like `list_resources`: the body is one blocking FFI call.
         let vtable_fn = self.vtable.expand_capabilities;
-        let handle = SendHandle(self.handle);
         let out = call_sync_vtable_bounded(
+            &self.instance,
             self.library.ffi_limits.data_timeout,
-            move || vtable_fn(handle.ptr()),
+            move |handle| vtable_fn(handle),
             abi_stable::std_types::RString::new,
         );
         let resp_bytes = out.len();
@@ -2771,15 +2844,16 @@ impl BackendPlugin for NativeBackendAdapter {
         // Completions are advisory, so a panic / timeout yields no suggestions
         // rather than pinning a tokio worker or failing the request.
         let vtable_fn = self.vtable.complete_template_variable;
-        let handle = SendHandle(self.handle);
         let args_str = abi_stable::std_types::RString::from(args_json);
         let out = if self.inline_fast {
-            vtable_fn(handle.ptr(), args_str)
+            vtable_fn(self.instance.ptr(), args_str)
         } else {
             let data_timeout = self.library.ffi_limits.data_timeout;
             match tokio::time::timeout(
                 data_timeout,
-                tokio::task::spawn_blocking(move || vtable_fn(handle.ptr(), args_str)),
+                ferry(Arc::clone(&self.instance), move |handle| {
+                    vtable_fn(handle, args_str)
+                }),
             )
             .await
             {
@@ -2841,7 +2915,7 @@ impl BackendPlugin for NativeBackendAdapter {
     }
 
     async fn shutdown(&self) {
-        guard_ffi_drop(|| (self.vtable.shutdown)(self.handle));
+        guard_ffi_drop(|| (self.vtable.shutdown)(self.instance.ptr()));
     }
 }
 
@@ -3126,13 +3200,12 @@ fn make_bytes_bridge(
 }
 
 /// RAII guard that cancels the plugin-side watch + drops the
-/// bridge box when the stream is dropped. Holding an
-/// `Arc<LoadedNativePlugin>` keeps the cdylib alive at least
-/// until cancellation completes.
+/// bridge box when the stream is dropped. Holding the instance
+/// keeps it, and the cdylib, alive at least until cancellation
+/// completes.
 struct StreamCancelGuard {
-    library: Arc<LoadedNativePlugin>,
+    instance: Arc<NativeInstance>,
     cancel_fn: extern "C" fn(RPluginHandle, usize),
-    plugin_handle: RPluginHandle,
     watch_handle: usize,
     bridge_ptr: *mut StreamBridge,
 }
@@ -3156,7 +3229,7 @@ impl Drop for StreamCancelGuard {
                 .cancelled
                 .store(true, std::sync::atomic::Ordering::Release);
         }
-        (self.cancel_fn)(self.plugin_handle, self.watch_handle);
+        (self.cancel_fn)(self.instance.ptr(), self.watch_handle);
         // Plugin's contract: no further callbacks after
         // `cancel_watch` returns. Safe to free the bridge now.
         // SAFETY: `bridge_ptr` was produced by
@@ -3164,7 +3237,6 @@ impl Drop for StreamCancelGuard {
         unsafe {
             drop(Box::from_raw(self.bridge_ptr));
         }
-        let _ = &self.library;
     }
 }
 
@@ -3250,13 +3322,12 @@ fn watch_strategy_entry(
 pub struct NativeWatchStrategyAdapter {
     library: Arc<LoadedNativePlugin>,
     vtable: WatchStrategyVTable,
-    handle: RPluginHandle,
+    instance: Arc<NativeInstance>,
     manifest: PluginManifest,
     kind: String,
     event_source: Option<mcpg_plugin_protocol::WatchStrategyDescriptor>,
     #[allow(dead_code)]
     alias: String,
-    _host_bridge: crate::host_bridge::HostBridge,
 }
 
 unsafe impl Send for NativeWatchStrategyAdapter {}
@@ -3343,23 +3414,17 @@ impl NativeWatchStrategyAdapter {
                 return Err(error);
             }
         };
+        let instance =
+            NativeInstance::new(Arc::clone(&library), handle, vt.drop_instance, host_bridge);
         Ok(Self {
             library,
             vtable: vt,
-            handle,
+            instance,
             manifest,
             kind,
             event_source,
             alias,
-            _host_bridge: host_bridge,
         })
-    }
-}
-
-impl Drop for NativeWatchStrategyAdapter {
-    fn drop(&mut self) {
-        guard_ffi_drop(|| (self.vtable.drop_instance)(self.handle));
-        let _ = &self.library;
     }
 }
 
@@ -3369,9 +3434,10 @@ impl Drop for NativeWatchStrategyAdapter {
 /// visible (matches `WatchHandle` trait contract).
 pub struct NativeWatchHandle {
     /// Cancel vtable slot + plugin instance — used inside
-    /// [`WatchHandle::cancel`] to tear down the watcher.
+    /// [`WatchHandle::cancel`] to tear down the watcher. Holding the
+    /// instance keeps it alive while the watch can still be cancelled.
     vtable: WatchStrategyVTable,
-    plugin_handle: RPluginHandle,
+    instance: Arc<NativeInstance>,
     watch_handle: usize,
     /// Boxed sink bridge the plugin still holds a pointer to. Dropped
     /// after `cancel()` returns so the plugin can't call back into
@@ -3398,7 +3464,7 @@ impl WatchHandle for NativeWatchHandle {
                 .cancelled
                 .store(true, std::sync::atomic::Ordering::Release);
         }
-        (self.vtable.cancel)(self.plugin_handle, self.watch_handle);
+        (self.vtable.cancel)(self.instance.ptr(), self.watch_handle);
         // Bridge stays alive until this NativeWatchHandle is Drop'd;
         // we don't null the pointer here because the plugin's cancel
         // MUST not emit further events (contract), so leaving the
@@ -3419,7 +3485,7 @@ impl WatchHandle for NativeWatchHandle {
             return;
         };
         (self.vtable.acknowledge)(
-            self.plugin_handle,
+            self.instance.ptr(),
             self.watch_handle,
             abi_stable::std_types::RString::from(json),
         );
@@ -3486,12 +3552,12 @@ impl WatchStrategyPlugin for NativeWatchStrategyAdapter {
         // A null handle is already the failure path, so a panic or timeout
         // surfaces as a refused subscription.
         let vtable_fn = self.vtable.watch;
-        let handle = SendHandle(self.handle);
         let uri = abi_stable::std_types::RString::from(resource_uri);
         let spec_arg = abi_stable::std_types::RString::from(spec_json);
         let result = call_sync_vtable_bounded(
+            &self.instance,
             self.library.ffi_limits.data_timeout,
-            move || vtable_fn(handle.ptr(), uri, spec_arg, sink_ref),
+            move |handle| vtable_fn(handle, uri, spec_arg, sink_ref),
             || mcpg_plugin_protocol::abi::StreamHandle {
                 handle: 0,
                 error_json: abi_stable::std_types::RString::from(
@@ -3525,14 +3591,14 @@ impl WatchStrategyPlugin for NativeWatchStrategyAdapter {
         }
         Ok(Box::new(NativeWatchHandle {
             vtable: clone_watch_strategy(&self.vtable),
-            plugin_handle: self.handle,
+            instance: Arc::clone(&self.instance),
             watch_handle: result.handle,
             sink_bridge: Some(bridge),
         }))
     }
 
     async fn shutdown(&self) {
-        guard_ffi_drop(|| (self.vtable.shutdown)(self.handle));
+        guard_ffi_drop(|| (self.vtable.shutdown)(self.instance.ptr()));
     }
 }
 
@@ -3559,14 +3625,12 @@ fn clone_http_route(vt: &HttpRouteVTable) -> HttpRouteVTable {
 }
 
 pub struct NativeHttpRouteAdapter {
-    library: Arc<LoadedNativePlugin>,
     vtable: HttpRouteVTable,
-    handle: RPluginHandle,
+    instance: Arc<NativeInstance>,
     manifest: PluginManifest,
     routes: Vec<RouteSpec>,
     #[allow(dead_code)]
     alias: String,
-    _host_bridge: crate::host_bridge::HostBridge,
 }
 
 unsafe impl Send for NativeHttpRouteAdapter {}
@@ -3644,22 +3708,14 @@ impl NativeHttpRouteAdapter {
                     .context("invalid routes JSON from native http_route plugin"));
             }
         };
+        let instance = NativeInstance::new(library, handle, vt.drop_instance, host_bridge);
         Ok(Self {
-            library,
             vtable: vt,
-            handle,
+            instance,
             manifest,
             routes,
             alias,
-            _host_bridge: host_bridge,
         })
-    }
-}
-
-impl Drop for NativeHttpRouteAdapter {
-    fn drop(&mut self) {
-        guard_ffi_drop(|| (self.vtable.drop_instance)(self.handle));
-        let _ = &self.library;
     }
 }
 
@@ -3721,23 +3777,25 @@ fn guard_ffi_drop(f: impl FnOnce()) {
 /// Run a SYNC trait-method vtable slot off the async worker under the
 /// per-plugin data timeout, catching a panic so it can't unwind across
 /// `extern "C"`. On a multi-thread runtime the call is offloaded via
-/// `spawn_blocking` + `tokio::time::timeout` (a hung slot can't pin a
-/// worker); on a current-thread runtime / outside tokio it runs directly
-/// under `catch_unwind` (no timeout — these are boot / best-effort paths).
-/// A timeout, join error, or panic yields `on_fail()`.
+/// [`ferry`], with `instance` held, + `tokio::time::timeout` (a hung slot
+/// can't pin a worker); on a current-thread runtime / outside tokio it runs
+/// directly under `catch_unwind` (no timeout — these are boot / best-effort
+/// paths). A timeout, join error, or panic yields `on_fail()`.
 fn call_sync_vtable_bounded<R: Send + 'static>(
+    instance: &Arc<NativeInstance>,
     data_timeout: std::time::Duration,
-    f: impl FnOnce() -> R + Send + 'static,
+    f: impl FnOnce(RPluginHandle) -> R + Send + 'static,
     on_fail: impl FnOnce() -> R,
 ) -> R {
     use tokio::runtime::{Handle, RuntimeFlavor};
-    let guarded = std::panic::AssertUnwindSafe(f);
-    let guarded = move || std::panic::catch_unwind(guarded);
+    let guarded = move |handle: RPluginHandle| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || f(handle)))
+    };
     match Handle::try_current() {
-        Ok(h) if h.runtime_flavor() == RuntimeFlavor::MultiThread => {
+        Ok(rt) if rt.runtime_flavor() == RuntimeFlavor::MultiThread => {
             let outcome = tokio::task::block_in_place(|| {
-                h.block_on(async {
-                    tokio::time::timeout(data_timeout, tokio::task::spawn_blocking(guarded)).await
+                rt.block_on(async {
+                    tokio::time::timeout(data_timeout, ferry(Arc::clone(instance), guarded)).await
                 })
             });
             match outcome {
@@ -3745,7 +3803,7 @@ fn call_sync_vtable_bounded<R: Send + 'static>(
                 _ => on_fail(),
             }
         }
-        _ => guarded().unwrap_or_else(|_| on_fail()),
+        _ => guarded(instance.ptr()).unwrap_or_else(|_| on_fail()),
     }
 }
 
@@ -3892,10 +3950,9 @@ impl HttpRoute for NativeHttpRouteAdapter {
         );
         let request_json = abi_stable::std_types::RString::from(request_str);
         let vtable_fn = self.vtable.handle_streaming;
-        let handle = SendHandle(self.handle);
         let plugin_id = self.manifest.id.clone();
-        let spawn_result = tokio::task::spawn_blocking(move || {
-            vtable_fn(handle.ptr(), request_json, sink, bytes_sink)
+        let spawn_result = ferry(Arc::clone(&self.instance), move |handle| {
+            vtable_fn(handle, request_json, sink, bytes_sink)
         })
         .await;
         let result = match spawn_result {
@@ -3955,7 +4012,7 @@ impl HttpRoute for NativeHttpRouteAdapter {
             Err(_) => {
                 // Adapter couldn't parse the head — cancel the
                 // stream and return a 500.
-                (self.vtable.cancel_stream)(self.handle, result.handle);
+                (self.vtable.cancel_stream)(self.instance.ptr(), result.handle);
                 unsafe {
                     drop(Box::from_raw(text_bridge_ptr.0));
                     drop(Box::from_raw(bytes_bridge_ptr.0));
@@ -3967,9 +4024,8 @@ impl HttpRoute for NativeHttpRouteAdapter {
             }
         };
         let guard = HttpStreamCancelGuard {
-            library: Arc::clone(&self.library),
+            instance: Arc::clone(&self.instance),
             cancel_fn: self.vtable.cancel_stream,
-            plugin_handle: self.handle,
             watch_handle: result.handle,
             text_bridge_ptr: text_bridge_ptr.0,
             bytes_bridge_ptr: bytes_bridge_ptr.0,
@@ -3986,7 +4042,7 @@ impl HttpRoute for NativeHttpRouteAdapter {
     }
 
     async fn shutdown(&self) {
-        guard_ffi_drop(|| (self.vtable.shutdown)(self.handle));
+        guard_ffi_drop(|| (self.vtable.shutdown)(self.instance.ptr()));
     }
 }
 
@@ -4062,9 +4118,8 @@ impl futures_core::Stream for HttpChunkStream {
 /// Specialised version of [`StreamCancelGuard`] because HTTP
 /// route streaming holds two bridges (text + bytes).
 struct HttpStreamCancelGuard {
-    library: Arc<LoadedNativePlugin>,
+    instance: Arc<NativeInstance>,
     cancel_fn: extern "C" fn(RPluginHandle, usize),
-    plugin_handle: RPluginHandle,
     watch_handle: usize,
     text_bridge_ptr: *mut StreamBridge,
     bytes_bridge_ptr: *mut BytesBridge,
@@ -4089,14 +4144,13 @@ impl Drop for HttpStreamCancelGuard {
                 .cancelled
                 .store(true, std::sync::atomic::Ordering::Release);
         }
-        (self.cancel_fn)(self.plugin_handle, self.watch_handle);
+        (self.cancel_fn)(self.instance.ptr(), self.watch_handle);
         // SAFETY: both pointers were produced by `Box::into_raw`
         // and have not been freed yet.
         unsafe {
             drop(Box::from_raw(self.text_bridge_ptr));
             drop(Box::from_raw(self.bytes_bridge_ptr));
         }
-        let _ = &self.library;
     }
 }
 
@@ -4147,7 +4201,7 @@ pub async fn dispatch_audit_emit_via_vtable(
         RPluginHandle,
         abi_stable::std_types::RString,
     ) -> abi_stable::std_types::RString,
-    handle: SendHandle,
+    handle: impl FerryHandle,
     plugin_id: String,
     event: AuditEvent,
     ffi_limits: &FfiLimits,
@@ -4160,7 +4214,7 @@ pub async fn dispatch_audit_emit_via_vtable(
         crate::ffi_metering::FfiCall::begin(&plugin_id, "audit_sink", "emit", event_json.len());
     let result = tokio::time::timeout(
         ffi_limits.data_timeout,
-        tokio::task::spawn_blocking(move || vtable_fn(handle.ptr(), event_json)),
+        ferry(handle, move |handle| vtable_fn(handle, event_json)),
     )
     .await;
     match result {
@@ -4237,7 +4291,7 @@ pub async fn dispatch_audit_emit_via_vtable(
 /// is the `{"ok": null}` / `{"err": AuditError}` envelope.
 pub async fn dispatch_audit_flush_via_vtable(
     vtable_fn: extern "C" fn(RPluginHandle, u64) -> abi_stable::std_types::RString,
-    handle: SendHandle,
+    handle: impl FerryHandle,
     plugin_id: String,
     timeout_ms: u64,
     ffi_limits: &FfiLimits,
@@ -4246,7 +4300,7 @@ pub async fn dispatch_audit_flush_via_vtable(
     // control timeout rather than the per-event data timeout.
     let result = tokio::time::timeout(
         ffi_limits.control_timeout,
-        tokio::task::spawn_blocking(move || vtable_fn(handle.ptr(), timeout_ms)),
+        ferry(handle, move |handle| vtable_fn(handle, timeout_ms)),
     )
     .await;
     match result {
@@ -4276,7 +4330,7 @@ pub async fn dispatch_audit_flush_via_vtable(
 /// the JSON round-trip behaviour.
 pub async fn dispatch_log_emit_via_vtable(
     vtable_fn: extern "C" fn(RPluginHandle, abi_stable::std_types::RStr<'_>),
-    handle: SendHandle,
+    handle: impl FerryHandle,
     plugin_id: String,
     record: LogRecord,
     inline_fast: bool,
@@ -4300,7 +4354,9 @@ pub async fn dispatch_log_emit_via_vtable(
     // the timeout bounds a hung plugin so it can't starve the runtime.
     let result = tokio::time::timeout(
         ffi_limits.data_timeout,
-        tokio::task::spawn_blocking(move || vtable_fn(handle.ptr(), record_json.as_str().into())),
+        ferry(handle, move |handle| {
+            vtable_fn(handle, record_json.as_str().into())
+        }),
     )
     .await;
     if result.is_err() {
@@ -4323,7 +4379,7 @@ pub async fn dispatch_log_emit_via_vtable(
 /// format is the `{"ok": null}` / `{"err": LogError}` envelope.
 pub async fn dispatch_log_flush_via_vtable(
     vtable_fn: extern "C" fn(RPluginHandle, u64) -> abi_stable::std_types::RString,
-    handle: SendHandle,
+    handle: impl FerryHandle,
     plugin_id: String,
     timeout_ms: u64,
     ffi_limits: &FfiLimits,
@@ -4331,7 +4387,7 @@ pub async fn dispatch_log_flush_via_vtable(
     // Flush is control-class.
     let result = tokio::time::timeout(
         ffi_limits.control_timeout,
-        tokio::task::spawn_blocking(move || vtable_fn(handle.ptr(), timeout_ms)),
+        ferry(handle, move |handle| vtable_fn(handle, timeout_ms)),
     )
     .await;
     match result {
@@ -4358,11 +4414,10 @@ pub async fn dispatch_log_flush_via_vtable(
 pub struct NativeAuditSinkAdapter {
     library: Arc<LoadedNativePlugin>,
     vtable: AuditSinkVTable,
-    handle: RPluginHandle,
+    instance: Arc<NativeInstance>,
     manifest: PluginManifest,
     #[allow(dead_code)]
     alias: String,
-    _host_bridge: crate::host_bridge::HostBridge,
 }
 
 unsafe impl Send for NativeAuditSinkAdapter {}
@@ -4431,21 +4486,15 @@ impl NativeAuditSinkAdapter {
                     .context("invalid manifest from native audit_sink plugin"));
             }
         };
+        let instance =
+            NativeInstance::new(Arc::clone(&library), handle, vt.drop_instance, host_bridge);
         Ok(Self {
             library,
             vtable: vt,
-            handle,
+            instance,
             manifest,
             alias,
-            _host_bridge: host_bridge,
         })
-    }
-}
-
-impl Drop for NativeAuditSinkAdapter {
-    fn drop(&mut self) {
-        guard_ffi_drop(|| (self.vtable.drop_instance)(self.handle));
-        let _ = &self.library;
     }
 }
 
@@ -4458,7 +4507,7 @@ impl AuditSink for NativeAuditSinkAdapter {
     async fn emit(&self, event: &AuditEvent) -> Result<AuditReceipt, AuditError> {
         dispatch_audit_emit_via_vtable(
             self.vtable.emit,
-            SendHandle(self.handle),
+            Arc::clone(&self.instance),
             self.manifest.id.clone(),
             event.clone(),
             &self.library.ffi_limits,
@@ -4469,7 +4518,7 @@ impl AuditSink for NativeAuditSinkAdapter {
     async fn flush(&self, timeout_ms: u64) -> Result<(), AuditError> {
         dispatch_audit_flush_via_vtable(
             self.vtable.flush,
-            SendHandle(self.handle),
+            Arc::clone(&self.instance),
             self.manifest.id.clone(),
             timeout_ms,
             &self.library.ffi_limits,
@@ -4478,14 +4527,14 @@ impl AuditSink for NativeAuditSinkAdapter {
     }
 
     async fn shutdown(&self) {
-        guard_ffi_drop(|| (self.vtable.shutdown)(self.handle));
+        guard_ffi_drop(|| (self.vtable.shutdown)(self.instance.ptr()));
     }
 }
 
 pub struct NativeLogSinkAdapter {
     library: Arc<LoadedNativePlugin>,
     vtable: LogSinkVTable,
-    handle: RPluginHandle,
+    instance: Arc<NativeInstance>,
     manifest: PluginManifest,
     #[allow(dead_code)]
     alias: String,
@@ -4493,7 +4542,6 @@ pub struct NativeLogSinkAdapter {
     /// For a sink this is largely off the request critical path (emit is often
     /// fire-and-forget), so the win is mostly reduced blocking-pool pressure.
     inline_fast: bool,
-    _host_bridge: crate::host_bridge::HostBridge,
 }
 
 unsafe impl Send for NativeLogSinkAdapter {}
@@ -4563,14 +4611,15 @@ impl NativeLogSinkAdapter {
                 );
             }
         };
+        let instance =
+            NativeInstance::new(Arc::clone(&library), handle, vt.drop_instance, host_bridge);
         Ok(Self {
             library,
             vtable: vt,
-            handle,
+            instance,
             manifest,
             alias,
             inline_fast: false,
-            _host_bridge: host_bridge,
         })
     }
 
@@ -4581,13 +4630,6 @@ impl NativeLogSinkAdapter {
     }
 }
 
-impl Drop for NativeLogSinkAdapter {
-    fn drop(&mut self) {
-        guard_ffi_drop(|| (self.vtable.drop_instance)(self.handle));
-        let _ = &self.library;
-    }
-}
-
 #[async_trait]
 impl LogSink for NativeLogSinkAdapter {
     fn manifest(&self) -> &PluginManifest {
@@ -4595,22 +4637,36 @@ impl LogSink for NativeLogSinkAdapter {
     }
 
     async fn emit(&self, record: &LogRecord) {
-        dispatch_log_emit_via_vtable(
-            self.vtable.emit,
-            SendHandle(self.handle),
-            self.manifest.id.clone(),
-            record.clone(),
-            self.inline_fast,
-            &self.library.ffi_limits,
-        )
-        .await;
+        if self.inline_fast {
+            // Inline, the slot returns before `emit` does, while `self`
+            // still holds the instance.
+            dispatch_log_emit_via_vtable(
+                self.vtable.emit,
+                SendHandle::new(self.instance.ptr()),
+                self.manifest.id.clone(),
+                record.clone(),
+                true,
+                &self.library.ffi_limits,
+            )
+            .await;
+        } else {
+            dispatch_log_emit_via_vtable(
+                self.vtable.emit,
+                Arc::clone(&self.instance),
+                self.manifest.id.clone(),
+                record.clone(),
+                false,
+                &self.library.ffi_limits,
+            )
+            .await;
+        }
     }
 
     async fn flush(&self, timeout: std::time::Duration) -> Result<(), LogError> {
         let timeout_ms = timeout.as_millis().min(u64::MAX as u128) as u64;
         dispatch_log_flush_via_vtable(
             self.vtable.flush,
-            SendHandle(self.handle),
+            Arc::clone(&self.instance),
             self.manifest.id.clone(),
             timeout_ms,
             &self.library.ffi_limits,
@@ -4619,7 +4675,7 @@ impl LogSink for NativeLogSinkAdapter {
     }
 
     async fn shutdown(&self) {
-        guard_ffi_drop(|| (self.vtable.shutdown)(self.handle));
+        guard_ffi_drop(|| (self.vtable.shutdown)(self.instance.ptr()));
     }
 }
 
@@ -4646,7 +4702,7 @@ fn clone_telemetry_sink(vt: &TelemetrySinkVTable) -> TelemetrySinkVTable {
 /// `()` return; timeout silently drops the event.
 async fn dispatch_telemetry_emit_via_vtable<T: serde::Serialize + Send + 'static>(
     vtable_fn: extern "C" fn(RPluginHandle, abi_stable::std_types::RString),
-    handle: SendHandle,
+    handle: impl FerryHandle,
     plugin_id: String,
     slot: &'static str,
     payload: T,
@@ -4658,7 +4714,7 @@ async fn dispatch_telemetry_emit_via_vtable<T: serde::Serialize + Send + 'static
     let call = crate::ffi_metering::FfiCall::begin(&plugin_id, "telemetry_sink", slot, json.len());
     let result = tokio::time::timeout(
         ffi_limits.data_timeout,
-        tokio::task::spawn_blocking(move || vtable_fn(handle.ptr(), json)),
+        ferry(handle, move |handle| vtable_fn(handle, json)),
     )
     .await;
     if result.is_err() {
@@ -4682,7 +4738,7 @@ async fn dispatch_telemetry_emit_via_vtable<T: serde::Serialize + Send + 'static
 /// TelemetryError}` envelope.
 pub async fn dispatch_telemetry_flush_via_vtable(
     vtable_fn: extern "C" fn(RPluginHandle, u64) -> abi_stable::std_types::RString,
-    handle: SendHandle,
+    handle: impl FerryHandle,
     plugin_id: String,
     timeout_ms: u64,
     ffi_limits: &FfiLimits,
@@ -4690,7 +4746,7 @@ pub async fn dispatch_telemetry_flush_via_vtable(
     // Flush is control-class.
     let result = tokio::time::timeout(
         ffi_limits.control_timeout,
-        tokio::task::spawn_blocking(move || vtable_fn(handle.ptr(), timeout_ms)),
+        ferry(handle, move |handle| vtable_fn(handle, timeout_ms)),
     )
     .await;
     match result {
@@ -4717,11 +4773,10 @@ pub async fn dispatch_telemetry_flush_via_vtable(
 pub struct NativeTelemetrySinkAdapter {
     library: Arc<LoadedNativePlugin>,
     vtable: TelemetrySinkVTable,
-    handle: RPluginHandle,
+    instance: Arc<NativeInstance>,
     manifest: PluginManifest,
     #[allow(dead_code)]
     alias: String,
-    _host_bridge: crate::host_bridge::HostBridge,
 }
 
 unsafe impl Send for NativeTelemetrySinkAdapter {}
@@ -4796,21 +4851,15 @@ impl NativeTelemetrySinkAdapter {
                     .context("invalid manifest from native telemetry_sink plugin"));
             }
         };
+        let instance =
+            NativeInstance::new(Arc::clone(&library), handle, vt.drop_instance, host_bridge);
         Ok(Self {
             library,
             vtable: vt,
-            handle,
+            instance,
             manifest,
             alias,
-            _host_bridge: host_bridge,
         })
-    }
-}
-
-impl Drop for NativeTelemetrySinkAdapter {
-    fn drop(&mut self) {
-        guard_ffi_drop(|| (self.vtable.drop_instance)(self.handle));
-        let _ = &self.library;
     }
 }
 
@@ -4823,7 +4872,7 @@ impl TelemetrySink for NativeTelemetrySinkAdapter {
     async fn span_started(&self, span: SpanStart) {
         dispatch_telemetry_emit_via_vtable(
             self.vtable.span_started,
-            SendHandle(self.handle),
+            Arc::clone(&self.instance),
             self.manifest.id.clone(),
             "span_started",
             span,
@@ -4835,7 +4884,7 @@ impl TelemetrySink for NativeTelemetrySinkAdapter {
     async fn span_ended(&self, span: SpanEnd) {
         dispatch_telemetry_emit_via_vtable(
             self.vtable.span_ended,
-            SendHandle(self.handle),
+            Arc::clone(&self.instance),
             self.manifest.id.clone(),
             "span_ended",
             span,
@@ -4847,7 +4896,7 @@ impl TelemetrySink for NativeTelemetrySinkAdapter {
     async fn metric_recorded(&self, metric: MetricPoint) {
         dispatch_telemetry_emit_via_vtable(
             self.vtable.metric_recorded,
-            SendHandle(self.handle),
+            Arc::clone(&self.instance),
             self.manifest.id.clone(),
             "metric_recorded",
             metric,
@@ -4859,7 +4908,7 @@ impl TelemetrySink for NativeTelemetrySinkAdapter {
     async fn log_recorded(&self, record: &LogRecord) {
         dispatch_telemetry_emit_via_vtable(
             self.vtable.log_recorded,
-            SendHandle(self.handle),
+            Arc::clone(&self.instance),
             self.manifest.id.clone(),
             "log_recorded",
             record.clone(),
@@ -4872,7 +4921,7 @@ impl TelemetrySink for NativeTelemetrySinkAdapter {
         let timeout_ms = timeout.as_millis().min(u64::MAX as u128) as u64;
         dispatch_telemetry_flush_via_vtable(
             self.vtable.flush,
-            SendHandle(self.handle),
+            Arc::clone(&self.instance),
             self.manifest.id.clone(),
             timeout_ms,
             &self.library.ffi_limits,
@@ -4881,7 +4930,7 @@ impl TelemetrySink for NativeTelemetrySinkAdapter {
     }
 
     async fn shutdown(&self) {
-        guard_ffi_drop(|| (self.vtable.shutdown)(self.handle));
+        guard_ffi_drop(|| (self.vtable.shutdown)(self.instance.ptr()));
     }
 }
 
@@ -4907,7 +4956,7 @@ fn clone_metrics_sink(vt: &MetricsSinkVTable) -> MetricsSinkVTable {
 /// the JSON round-trip behaviour.
 pub async fn dispatch_metrics_emit_via_vtable(
     vtable_fn: extern "C" fn(RPluginHandle, abi_stable::std_types::RString),
-    handle: SendHandle,
+    handle: impl FerryHandle,
     plugin_id: String,
     metric: MetricPoint,
     ffi_limits: &FfiLimits,
@@ -4921,7 +4970,7 @@ pub async fn dispatch_metrics_emit_via_vtable(
         crate::ffi_metering::FfiCall::begin(&plugin_id, "metrics_sink", "emit", metric_json.len());
     let result = tokio::time::timeout(
         ffi_limits.data_timeout,
-        tokio::task::spawn_blocking(move || vtable_fn(handle.ptr(), metric_json)),
+        ferry(handle, move |handle| vtable_fn(handle, metric_json)),
     )
     .await;
     if result.is_err() {
@@ -4945,7 +4994,7 @@ pub async fn dispatch_metrics_emit_via_vtable(
 /// envelope.
 pub async fn dispatch_metrics_flush_via_vtable(
     vtable_fn: extern "C" fn(RPluginHandle, u64) -> abi_stable::std_types::RString,
-    handle: SendHandle,
+    handle: impl FerryHandle,
     plugin_id: String,
     timeout_ms: u64,
     ffi_limits: &FfiLimits,
@@ -4953,7 +5002,7 @@ pub async fn dispatch_metrics_flush_via_vtable(
     // Flush is control-class.
     let result = tokio::time::timeout(
         ffi_limits.control_timeout,
-        tokio::task::spawn_blocking(move || vtable_fn(handle.ptr(), timeout_ms)),
+        ferry(handle, move |handle| vtable_fn(handle, timeout_ms)),
     )
     .await;
     match result {
@@ -4980,11 +5029,10 @@ pub async fn dispatch_metrics_flush_via_vtable(
 pub struct NativeMetricsSinkAdapter {
     library: Arc<LoadedNativePlugin>,
     vtable: MetricsSinkVTable,
-    handle: RPluginHandle,
+    instance: Arc<NativeInstance>,
     manifest: PluginManifest,
     #[allow(dead_code)]
     alias: String,
-    _host_bridge: crate::host_bridge::HostBridge,
 }
 
 unsafe impl Send for NativeMetricsSinkAdapter {}
@@ -5053,21 +5101,15 @@ impl NativeMetricsSinkAdapter {
                     .context("invalid manifest from native metrics_sink plugin"));
             }
         };
+        let instance =
+            NativeInstance::new(Arc::clone(&library), handle, vt.drop_instance, host_bridge);
         Ok(Self {
             library,
             vtable: vt,
-            handle,
+            instance,
             manifest,
             alias,
-            _host_bridge: host_bridge,
         })
-    }
-}
-
-impl Drop for NativeMetricsSinkAdapter {
-    fn drop(&mut self) {
-        guard_ffi_drop(|| (self.vtable.drop_instance)(self.handle));
-        let _ = &self.library;
     }
 }
 
@@ -5080,7 +5122,7 @@ impl MetricsSink for NativeMetricsSinkAdapter {
     async fn emit(&self, metric: &MetricPoint) {
         dispatch_metrics_emit_via_vtable(
             self.vtable.emit,
-            SendHandle(self.handle),
+            Arc::clone(&self.instance),
             self.manifest.id.clone(),
             metric.clone(),
             &self.library.ffi_limits,
@@ -5092,7 +5134,7 @@ impl MetricsSink for NativeMetricsSinkAdapter {
         let timeout_ms = timeout.as_millis().min(u64::MAX as u128) as u64;
         dispatch_metrics_flush_via_vtable(
             self.vtable.flush,
-            SendHandle(self.handle),
+            Arc::clone(&self.instance),
             self.manifest.id.clone(),
             timeout_ms,
             &self.library.ffi_limits,
@@ -5109,10 +5151,9 @@ impl MetricsSink for NativeMetricsSinkAdapter {
         // native dispatch helpers use.
         let plugin_id = self.manifest.id.clone();
         let vtable_fn = self.vtable.render_text_exposition;
-        let handle = SendHandle(self.handle);
         let result = tokio::time::timeout(
             self.library.ffi_limits.control_timeout,
-            tokio::task::spawn_blocking(move || vtable_fn(handle.ptr())),
+            ferry(Arc::clone(&self.instance), move |handle| vtable_fn(handle)),
         )
         .await;
         match result {
@@ -5134,7 +5175,7 @@ impl MetricsSink for NativeMetricsSinkAdapter {
     }
 
     async fn shutdown(&self) {
-        guard_ffi_drop(|| (self.vtable.shutdown)(self.handle));
+        guard_ffi_drop(|| (self.vtable.shutdown)(self.instance.ptr()));
     }
 }
 
@@ -5192,7 +5233,7 @@ async fn call_json_vtable(
         RPluginHandle,
         abi_stable::std_types::RString,
     ) -> abi_stable::std_types::RString,
-    handle: SendHandle,
+    handle: impl FerryHandle,
     args: serde_json::Value,
     plugin_id: &str,
     kind: &'static str,
@@ -5205,7 +5246,7 @@ async fn call_json_vtable(
     let json = abi_stable::std_types::RString::from(json_str);
     let result = tokio::time::timeout(
         data_timeout,
-        tokio::task::spawn_blocking(move || vtable_fn(handle.ptr(), json)),
+        ferry(handle, move |handle| vtable_fn(handle, json)),
     )
     .await
     .ok()
@@ -5296,12 +5337,11 @@ fn decode_cache_wire<T: serde::de::DeserializeOwned>(
 pub struct NativeStoreAdapter {
     library: Arc<LoadedNativePlugin>,
     vtable: StoreVTable,
-    handle: RPluginHandle,
+    instance: Arc<NativeInstance>,
     manifest: PluginManifest,
     supported_roles: Vec<StoreRole>,
     #[allow(dead_code)]
     alias: String,
-    _host_bridge: crate::host_bridge::HostBridge,
 }
 
 unsafe impl Send for NativeStoreAdapter {}
@@ -5371,22 +5411,16 @@ impl NativeStoreAdapter {
                 guard_ffi_drop(|| (vt.drop_instance)(handle));
                 anyhow::Error::from(e).context("invalid supported_roles JSON")
             })?;
+        let instance =
+            NativeInstance::new(Arc::clone(&library), handle, vt.drop_instance, host_bridge);
         Ok(Self {
             library,
             vtable: vt,
-            handle,
+            instance,
             manifest,
             supported_roles,
             alias,
-            _host_bridge: host_bridge,
         })
-    }
-}
-
-impl Drop for NativeStoreAdapter {
-    fn drop(&mut self) {
-        guard_ffi_drop(|| (self.vtable.drop_instance)(self.handle));
-        let _ = &self.library;
     }
 }
 
@@ -5403,7 +5437,7 @@ impl Store for NativeStoreAdapter {
     async fn get(&self, role: StoreRole, key: &str) -> Result<Option<StoreValue>, StoreError> {
         let raw = call_json_vtable(
             self.vtable.get,
-            SendHandle(self.handle),
+            Arc::clone(&self.instance),
             serde_json::json!({ "role": role, "key": key }),
             &self.manifest.id,
             "store",
@@ -5422,7 +5456,7 @@ impl Store for NativeStoreAdapter {
         let wire: StoreValueWire = value.into();
         let raw = call_json_vtable(
             self.vtable.put,
-            SendHandle(self.handle),
+            Arc::clone(&self.instance),
             serde_json::json!({ "role": role, "key": key, "value": wire }),
             &self.manifest.id,
             "store",
@@ -5439,7 +5473,7 @@ impl Store for NativeStoreAdapter {
     async fn delete(&self, role: StoreRole, key: &str) -> Result<(), StoreError> {
         let raw = call_json_vtable(
             self.vtable.delete,
-            SendHandle(self.handle),
+            Arc::clone(&self.instance),
             serde_json::json!({ "role": role, "key": key }),
             &self.manifest.id,
             "store",
@@ -5461,7 +5495,7 @@ impl Store for NativeStoreAdapter {
     ) -> Result<StorePage, StoreError> {
         let raw = call_json_vtable(
             self.vtable.list,
-            SendHandle(self.handle),
+            Arc::clone(&self.instance),
             serde_json::json!({ "role": role, "prefix": prefix, "cursor": cursor }),
             &self.manifest.id,
             "store",
@@ -5487,7 +5521,7 @@ impl Store for NativeStoreAdapter {
         let new_wire: StoreValueWire = new.into();
         let raw = call_json_vtable(
             self.vtable.compare_and_swap,
-            SendHandle(self.handle),
+            Arc::clone(&self.instance),
             serde_json::json!({
                 "role": role,
                 "key": key,
@@ -5515,7 +5549,7 @@ impl Store for NativeStoreAdapter {
         let wire: StoreValueWire = value.into();
         let raw = call_json_vtable(
             self.vtable.append,
-            SendHandle(self.handle),
+            Arc::clone(&self.instance),
             serde_json::json!({ "role": role, "key": key, "value": wire }),
             &self.manifest.id,
             "store",
@@ -5539,10 +5573,11 @@ impl Store for NativeStoreAdapter {
             serde_json::to_string(&args).unwrap_or_else(|_| "{}".into()),
         );
         let vtable_fn = self.vtable.watch;
-        let handle = SendHandle(self.handle);
         let plugin_id = self.manifest.id.clone();
-        let spawn_result =
-            tokio::task::spawn_blocking(move || vtable_fn(handle.ptr(), args_json, sink)).await;
+        let spawn_result = ferry(Arc::clone(&self.instance), move |handle| {
+            vtable_fn(handle, args_json, sink)
+        })
+        .await;
         let result = match spawn_result {
             Ok(r) => r,
             Err(_) => {
@@ -5577,9 +5612,8 @@ impl Store for NativeStoreAdapter {
             return Err(err);
         }
         let guard = StreamCancelGuard {
-            library: Arc::clone(&self.library),
+            instance: Arc::clone(&self.instance),
             cancel_fn: self.vtable.cancel_watch,
-            plugin_handle: self.handle,
             watch_handle: result.handle,
             bridge_ptr: bridge_ptr.0,
         };
@@ -5587,7 +5621,7 @@ impl Store for NativeStoreAdapter {
     }
 
     async fn shutdown(&self) {
-        guard_ffi_drop(|| (self.vtable.shutdown)(self.handle));
+        guard_ffi_drop(|| (self.vtable.shutdown)(self.instance.ptr()));
     }
 }
 
@@ -5632,13 +5666,12 @@ impl futures_core::Stream for StoreWatchStream {
 pub struct NativeCacheAdapter {
     library: Arc<LoadedNativePlugin>,
     vtable: CacheVTable,
-    handle: RPluginHandle,
+    instance: Arc<NativeInstance>,
     manifest: PluginManifest,
     supported_namespaces: Vec<String>,
     serves_any: bool,
     #[allow(dead_code)]
     alias: String,
-    _host_bridge: crate::host_bridge::HostBridge,
 }
 
 unsafe impl Send for NativeCacheAdapter {}
@@ -5709,23 +5742,17 @@ impl NativeCacheAdapter {
                 anyhow::Error::from(e).context("invalid supported_namespaces JSON")
             })?;
         let serves_any = (vt.serves_any_namespace)(handle) != 0;
+        let instance =
+            NativeInstance::new(Arc::clone(&library), handle, vt.drop_instance, host_bridge);
         Ok(Self {
             library,
             vtable: vt,
-            handle,
+            instance,
             manifest,
             supported_namespaces,
             serves_any,
             alias,
-            _host_bridge: host_bridge,
         })
-    }
-}
-
-impl Drop for NativeCacheAdapter {
-    fn drop(&mut self) {
-        guard_ffi_drop(|| (self.vtable.drop_instance)(self.handle));
-        let _ = &self.library;
     }
 }
 
@@ -5746,7 +5773,7 @@ impl Cache for NativeCacheAdapter {
     async fn get(&self, ns: &str, key: &str) -> Option<bytes::Bytes> {
         let raw = call_json_vtable(
             self.vtable.get,
-            SendHandle(self.handle),
+            Arc::clone(&self.instance),
             serde_json::json!({ "ns": ns, "key": key }),
             &self.manifest.id,
             "cache",
@@ -5767,7 +5794,7 @@ impl Cache for NativeCacheAdapter {
     ) -> Result<(), CacheError> {
         let raw = call_json_vtable(
             self.vtable.put,
-            SendHandle(self.handle),
+            Arc::clone(&self.instance),
             serde_json::json!({
                 "ns": ns,
                 "key": key,
@@ -5797,10 +5824,11 @@ impl Cache for NativeCacheAdapter {
             crate::ffi_metering::FfiCall::begin(&self.manifest.id, "cache", "delete", req_bytes);
         let json = abi_stable::std_types::RString::from(json_str);
         let vt_fn = self.vtable.delete;
-        let handle = SendHandle(self.handle);
         let outcome = tokio::time::timeout(
             self.library.ffi_limits.data_timeout,
-            tokio::task::spawn_blocking(move || vt_fn(handle.ptr(), json)),
+            ferry(Arc::clone(&self.instance), move |handle| {
+                vt_fn(handle, json)
+            }),
         )
         .await;
         match outcome {
@@ -5812,7 +5840,7 @@ impl Cache for NativeCacheAdapter {
     async fn clear(&self, ns: &str) -> Result<(), CacheError> {
         let raw = call_json_vtable(
             self.vtable.clear,
-            SendHandle(self.handle),
+            Arc::clone(&self.instance),
             serde_json::json!({ "ns": ns }),
             &self.manifest.id,
             "cache",
@@ -5835,7 +5863,7 @@ impl Cache for NativeCacheAdapter {
     ) -> Result<i64, CacheError> {
         let raw = call_json_vtable(
             self.vtable.incr,
-            SendHandle(self.handle),
+            Arc::clone(&self.instance),
             serde_json::json!({
                 "ns": ns,
                 "key": key,
@@ -5855,7 +5883,7 @@ impl Cache for NativeCacheAdapter {
     }
 
     async fn shutdown(&self) {
-        guard_ffi_drop(|| (self.vtable.shutdown)(self.handle));
+        guard_ffi_drop(|| (self.vtable.shutdown)(self.instance.ptr()));
     }
 }
 
@@ -5892,12 +5920,11 @@ fn clone_config_provider(vt: &ConfigProviderVTable) -> ConfigProviderVTable {
 pub struct NativeSecretProviderAdapter {
     library: Arc<LoadedNativePlugin>,
     vtable: SecretProviderVTable,
-    handle: RPluginHandle,
+    instance: Arc<NativeInstance>,
     manifest: PluginManifest,
     supported_schemes: Vec<String>,
     #[allow(dead_code)]
     alias: String,
-    _host_bridge: crate::host_bridge::HostBridge,
 }
 
 unsafe impl Send for NativeSecretProviderAdapter {}
@@ -5975,22 +6002,16 @@ impl NativeSecretProviderAdapter {
                 guard_ffi_drop(|| (vt.drop_instance)(handle));
                 anyhow::Error::from(e).context("invalid supported_schemes")
             })?;
+        let instance =
+            NativeInstance::new(Arc::clone(&library), handle, vt.drop_instance, host_bridge);
         Ok(Self {
             library,
             vtable: vt,
-            handle,
+            instance,
             manifest,
             supported_schemes,
             alias,
-            _host_bridge: host_bridge,
         })
-    }
-}
-
-impl Drop for NativeSecretProviderAdapter {
-    fn drop(&mut self) {
-        guard_ffi_drop(|| (self.vtable.drop_instance)(self.handle));
-        let _ = &self.library;
     }
 }
 
@@ -6006,7 +6027,6 @@ impl SecretProvider for NativeSecretProviderAdapter {
 
     async fn get(&self, secret_ref: &str) -> Result<SecretValue, SecretError> {
         let vtable_fn = self.vtable.get;
-        let handle = SendHandle(self.handle);
         let plugin_id = self.manifest.id.clone();
         // Instrument the host→plugin get call.
         let call = crate::ffi_metering::FfiCall::begin(
@@ -6018,7 +6038,9 @@ impl SecretProvider for NativeSecretProviderAdapter {
         let reference = abi_stable::std_types::RString::from(secret_ref);
         let result = tokio::time::timeout(
             self.library.ffi_limits.data_timeout,
-            tokio::task::spawn_blocking(move || vtable_fn(handle.ptr(), reference)),
+            ferry(Arc::clone(&self.instance), move |handle| {
+                vtable_fn(handle, reference)
+            }),
         )
         .await;
         let raw = match result {
@@ -6067,7 +6089,6 @@ impl SecretProvider for NativeSecretProviderAdapter {
         let bridge_ptr = SendPtr(bridge_ptr_raw);
         let reference = abi_stable::std_types::RString::from(secret_ref);
         let vtable_fn = self.vtable.watch;
-        let handle = SendHandle(self.handle);
         let plugin_id = self.manifest.id.clone();
         // Instrument the host→plugin watch install call only.
         // Rotation events are emitted on the plugin thread through
@@ -6078,8 +6099,10 @@ impl SecretProvider for NativeSecretProviderAdapter {
             "watch",
             secret_ref.len(),
         );
-        let spawn_result =
-            tokio::task::spawn_blocking(move || vtable_fn(handle.ptr(), reference, sink)).await;
+        let spawn_result = ferry(Arc::clone(&self.instance), move |handle| {
+            vtable_fn(handle, reference, sink)
+        })
+        .await;
         let result = match spawn_result {
             Ok(r) => r,
             Err(_) => {
@@ -6107,9 +6130,8 @@ impl SecretProvider for NativeSecretProviderAdapter {
         }
         call.end_ok(resp_bytes);
         let guard = StreamCancelGuard {
-            library: Arc::clone(&self.library),
+            instance: Arc::clone(&self.instance),
             cancel_fn: self.vtable.cancel_watch,
-            plugin_handle: self.handle,
             watch_handle: result.handle,
             bridge_ptr: bridge_ptr.0,
         };
@@ -6117,7 +6139,7 @@ impl SecretProvider for NativeSecretProviderAdapter {
     }
 
     async fn shutdown(&self) {
-        guard_ffi_drop(|| (self.vtable.shutdown)(self.handle));
+        guard_ffi_drop(|| (self.vtable.shutdown)(self.instance.ptr()));
     }
 }
 
@@ -6152,12 +6174,11 @@ impl futures_core::Stream for SecretWatchStream {
 pub struct NativeConfigProviderAdapter {
     library: Arc<LoadedNativePlugin>,
     vtable: ConfigProviderVTable,
-    handle: RPluginHandle,
+    instance: Arc<NativeInstance>,
     manifest: PluginManifest,
     supported_schemes: Vec<String>,
     #[allow(dead_code)]
     alias: String,
-    _host_bridge: crate::host_bridge::HostBridge,
 }
 
 unsafe impl Send for NativeConfigProviderAdapter {}
@@ -6235,22 +6256,16 @@ impl NativeConfigProviderAdapter {
                 guard_ffi_drop(|| (vt.drop_instance)(handle));
                 anyhow::Error::from(e).context("invalid supported_schemes")
             })?;
+        let instance =
+            NativeInstance::new(Arc::clone(&library), handle, vt.drop_instance, host_bridge);
         Ok(Self {
             library,
             vtable: vt,
-            handle,
+            instance,
             manifest,
             supported_schemes,
             alias,
-            _host_bridge: host_bridge,
         })
-    }
-}
-
-impl Drop for NativeConfigProviderAdapter {
-    fn drop(&mut self) {
-        guard_ffi_drop(|| (self.vtable.drop_instance)(self.handle));
-        let _ = &self.library;
     }
 }
 
@@ -6266,7 +6281,6 @@ impl ConfigProvider for NativeConfigProviderAdapter {
 
     async fn snapshot(&self, reference: &str) -> Result<ConfigSnapshot, ConfigError> {
         let vtable_fn = self.vtable.snapshot;
-        let handle = SendHandle(self.handle);
         let plugin_id = self.manifest.id.clone();
         // Instrument the host→plugin snapshot call.
         let call = crate::ffi_metering::FfiCall::begin(
@@ -6278,7 +6292,9 @@ impl ConfigProvider for NativeConfigProviderAdapter {
         let r = abi_stable::std_types::RString::from(reference);
         let result = tokio::time::timeout(
             self.library.ffi_limits.control_timeout,
-            tokio::task::spawn_blocking(move || vtable_fn(handle.ptr(), r)),
+            ferry(Arc::clone(&self.instance), move |handle| {
+                vtable_fn(handle, r)
+            }),
         )
         .await;
         let raw = match result {
@@ -6327,7 +6343,6 @@ impl ConfigProvider for NativeConfigProviderAdapter {
         let bridge_ptr = SendPtr(bridge_ptr_raw);
         let r = abi_stable::std_types::RString::from(reference);
         let vtable_fn = self.vtable.watch;
-        let handle = SendHandle(self.handle);
         let plugin_id = self.manifest.id.clone();
         // Instrument the host→plugin watch install call only.
         let call = crate::ffi_metering::FfiCall::begin(
@@ -6336,8 +6351,10 @@ impl ConfigProvider for NativeConfigProviderAdapter {
             "watch",
             reference.len(),
         );
-        let spawn_result =
-            tokio::task::spawn_blocking(move || vtable_fn(handle.ptr(), r, sink)).await;
+        let spawn_result = ferry(Arc::clone(&self.instance), move |handle| {
+            vtable_fn(handle, r, sink)
+        })
+        .await;
         let result = match spawn_result {
             Ok(r) => r,
             Err(_) => {
@@ -6365,9 +6382,8 @@ impl ConfigProvider for NativeConfigProviderAdapter {
         }
         call.end_ok(resp_bytes);
         let guard = StreamCancelGuard {
-            library: Arc::clone(&self.library),
+            instance: Arc::clone(&self.instance),
             cancel_fn: self.vtable.cancel_watch,
-            plugin_handle: self.handle,
             watch_handle: result.handle,
             bridge_ptr: bridge_ptr.0,
         };
@@ -6375,7 +6391,7 @@ impl ConfigProvider for NativeConfigProviderAdapter {
     }
 
     async fn shutdown(&self) {
-        guard_ffi_drop(|| (self.vtable.shutdown)(self.handle));
+        guard_ffi_drop(|| (self.vtable.shutdown)(self.instance.ptr()));
     }
 }
 
@@ -6426,12 +6442,11 @@ fn clone_policy_engine(vt: &PolicyEngineVTable) -> PolicyEngineVTable {
 pub struct NativePolicyEngineAdapter {
     library: Arc<LoadedNativePlugin>,
     vtable: PolicyEngineVTable,
-    handle: RPluginHandle,
+    instance: Arc<NativeInstance>,
     manifest: PluginManifest,
     name: String,
     #[allow(dead_code)]
     alias: String,
-    _host_bridge: crate::host_bridge::HostBridge,
 }
 
 unsafe impl Send for NativePolicyEngineAdapter {}
@@ -6520,22 +6535,16 @@ impl NativePolicyEngineAdapter {
             return Err(anyhow!("native policy_engine plugin returned empty name"));
         }
         let name = name_rstr.as_str().to_owned();
+        let instance =
+            NativeInstance::new(Arc::clone(&library), handle, vt.drop_instance, host_bridge);
         Ok(Self {
             library,
             vtable: vt,
-            handle,
+            instance,
             manifest,
             name,
             alias,
-            _host_bridge: host_bridge,
         })
-    }
-}
-
-impl Drop for NativePolicyEngineAdapter {
-    fn drop(&mut self) {
-        guard_ffi_drop(|| (self.vtable.drop_instance)(self.handle));
-        let _ = &self.library;
     }
 }
 
@@ -6570,11 +6579,12 @@ impl PolicyEngine for NativePolicyEngineAdapter {
         );
         let args_json = abi_stable::std_types::RString::from(args_str);
         let vtable_fn = self.vtable.evaluate;
-        let handle = SendHandle(self.handle);
         let plugin_id = self.manifest.id.clone();
         let result = tokio::time::timeout(
             self.library.ffi_limits.data_timeout,
-            tokio::task::spawn_blocking(move || vtable_fn(handle.ptr(), args_json)),
+            ferry(Arc::clone(&self.instance), move |handle| {
+                vtable_fn(handle, args_json)
+            }),
         )
         .await;
         match result {
@@ -6624,10 +6634,9 @@ impl PolicyEngine for NativePolicyEngineAdapter {
 
     async fn policy_version(&self) -> PolicyVersion {
         let vtable_fn = self.vtable.policy_version;
-        let handle = SendHandle(self.handle);
         let result = tokio::time::timeout(
             self.library.ffi_limits.control_timeout,
-            tokio::task::spawn_blocking(move || vtable_fn(handle.ptr())),
+            ferry(Arc::clone(&self.instance), move |handle| vtable_fn(handle)),
         )
         .await;
         let raw = match result {
@@ -6648,7 +6657,7 @@ impl PolicyEngine for NativePolicyEngineAdapter {
     }
 
     async fn shutdown(&self) {
-        guard_ffi_drop(|| (self.vtable.shutdown)(self.handle));
+        guard_ffi_drop(|| (self.vtable.shutdown)(self.instance.ptr()));
     }
 }
 
@@ -6672,11 +6681,10 @@ fn clone_credential_issuer(
 pub struct NativeCredentialIssuerAdapter {
     library: Arc<LoadedNativePlugin>,
     vtable: mcpg_plugin_protocol::abi::CredentialIssuerVTable,
-    handle: RPluginHandle,
+    instance: Arc<NativeInstance>,
     manifest: PluginManifest,
     #[allow(dead_code)]
     alias: String,
-    _host_bridge: crate::host_bridge::HostBridge,
 }
 
 unsafe impl Send for NativeCredentialIssuerAdapter {}
@@ -6748,21 +6756,15 @@ impl NativeCredentialIssuerAdapter {
                 guard_ffi_drop(|| (vt.drop_instance)(handle));
                 anyhow::Error::from(e).context("invalid manifest from credential_issuer")
             })?;
+        let instance =
+            NativeInstance::new(Arc::clone(&library), handle, vt.drop_instance, host_bridge);
         Ok(Self {
             library,
             vtable: vt,
-            handle,
+            instance,
             manifest,
             alias,
-            _host_bridge: host_bridge,
         })
-    }
-}
-
-impl Drop for NativeCredentialIssuerAdapter {
-    fn drop(&mut self) {
-        guard_ffi_drop(|| (self.vtable.drop_instance)(self.handle));
-        let _ = &self.library;
     }
 }
 
@@ -6796,11 +6798,12 @@ impl mcpg_plugin_protocol::credential::CredentialIssuer for NativeCredentialIssu
         );
         let args_json = abi_stable::std_types::RString::from(args_str);
         let vtable_fn = self.vtable.issue;
-        let handle = SendHandle(self.handle);
         let plugin_id = self.manifest.id.clone();
         let result = tokio::time::timeout(
             self.library.ffi_limits.data_timeout,
-            tokio::task::spawn_blocking(move || vtable_fn(handle.ptr(), args_json)),
+            ferry(Arc::clone(&self.instance), move |handle| {
+                vtable_fn(handle, args_json)
+            }),
         )
         .await;
         match result {
@@ -6863,11 +6866,12 @@ impl mcpg_plugin_protocol::credential::CredentialIssuer for NativeCredentialIssu
         );
         let arg = abi_stable::std_types::RString::from(lease_id);
         let vtable_fn = self.vtable.revoke;
-        let handle = SendHandle(self.handle);
         let plugin_id = self.manifest.id.clone();
         let result = tokio::time::timeout(
             self.library.ffi_limits.control_timeout,
-            tokio::task::spawn_blocking(move || vtable_fn(handle.ptr(), arg)),
+            ferry(Arc::clone(&self.instance), move |handle| {
+                vtable_fn(handle, arg)
+            }),
         )
         .await;
         match result {
@@ -6908,7 +6912,7 @@ impl mcpg_plugin_protocol::credential::CredentialIssuer for NativeCredentialIssu
     }
 
     async fn shutdown(&self) {
-        guard_ffi_drop(|| (self.vtable.shutdown)(self.handle));
+        guard_ffi_drop(|| (self.vtable.shutdown)(self.instance.ptr()));
     }
 }
 
@@ -6931,11 +6935,10 @@ fn clone_approval_notifier(
 pub struct NativeApprovalNotifierAdapter {
     library: Arc<LoadedNativePlugin>,
     vtable: mcpg_plugin_protocol::abi::ApprovalNotifierVTable,
-    handle: RPluginHandle,
+    instance: Arc<NativeInstance>,
     manifest: PluginManifest,
     #[allow(dead_code)]
     alias: String,
-    _host_bridge: crate::host_bridge::HostBridge,
 }
 
 unsafe impl Send for NativeApprovalNotifierAdapter {}
@@ -7007,21 +7010,15 @@ impl NativeApprovalNotifierAdapter {
                 guard_ffi_drop(|| (vt.drop_instance)(handle));
                 anyhow::Error::from(e).context("invalid manifest from approval_notifier")
             })?;
+        let instance =
+            NativeInstance::new(Arc::clone(&library), handle, vt.drop_instance, host_bridge);
         Ok(Self {
             library,
             vtable: vt,
-            handle,
+            instance,
             manifest,
             alias,
-            _host_bridge: host_bridge,
         })
-    }
-}
-
-impl Drop for NativeApprovalNotifierAdapter {
-    fn drop(&mut self) {
-        guard_ffi_drop(|| (self.vtable.drop_instance)(self.handle));
-        let _ = &self.library;
     }
 }
 
@@ -7048,11 +7045,12 @@ impl mcpg_plugin_protocol::approval_notifier::ApprovalNotifier for NativeApprova
         );
         let req_json = abi_stable::std_types::RString::from(req_str);
         let vtable_fn = self.vtable.notify;
-        let handle = SendHandle(self.handle);
         let plugin_id = self.manifest.id.clone();
         let result = tokio::time::timeout(
             self.library.ffi_limits.data_timeout,
-            tokio::task::spawn_blocking(move || vtable_fn(handle.ptr(), req_json)),
+            ferry(Arc::clone(&self.instance), move |handle| {
+                vtable_fn(handle, req_json)
+            }),
         )
         .await;
         match result {
@@ -7111,7 +7109,7 @@ impl mcpg_plugin_protocol::approval_notifier::ApprovalNotifier for NativeApprova
     }
 
     async fn shutdown(&self) {
-        guard_ffi_drop(|| (self.vtable.shutdown)(self.handle));
+        guard_ffi_drop(|| (self.vtable.shutdown)(self.instance.ptr()));
     }
 }
 
@@ -7136,11 +7134,10 @@ fn clone_catalog_provider(
 pub struct NativeCatalogProviderAdapter {
     library: Arc<LoadedNativePlugin>,
     vtable: mcpg_plugin_protocol::abi::CatalogProviderVTable,
-    handle: RPluginHandle,
+    instance: Arc<NativeInstance>,
     manifest: PluginManifest,
     #[allow(dead_code)]
     alias: String,
-    _host_bridge: crate::host_bridge::HostBridge,
 }
 
 unsafe impl Send for NativeCatalogProviderAdapter {}
@@ -7212,21 +7209,15 @@ impl NativeCatalogProviderAdapter {
                 guard_ffi_drop(|| (vt.drop_instance)(handle));
                 anyhow::Error::from(e).context("invalid manifest from catalog_provider")
             })?;
+        let instance =
+            NativeInstance::new(Arc::clone(&library), handle, vt.drop_instance, host_bridge);
         Ok(Self {
             library,
             vtable: vt,
-            handle,
+            instance,
             manifest,
             alias,
-            _host_bridge: host_bridge,
         })
-    }
-}
-
-impl Drop for NativeCatalogProviderAdapter {
-    fn drop(&mut self) {
-        guard_ffi_drop(|| (self.vtable.drop_instance)(self.handle));
-        let _ = &self.library;
     }
 }
 
@@ -7255,11 +7246,12 @@ impl mcpg_plugin_protocol::catalog::CatalogProvider for NativeCatalogProviderAda
         );
         let args_json = abi_stable::std_types::RString::from(args_str);
         let vtable_fn = self.vtable.filter_and_enrich;
-        let handle = SendHandle(self.handle);
         let plugin_id = self.manifest.id.clone();
         let result = tokio::time::timeout(
             self.library.ffi_limits.data_timeout,
-            tokio::task::spawn_blocking(move || vtable_fn(handle.ptr(), args_json)),
+            ferry(Arc::clone(&self.instance), move |handle| {
+                vtable_fn(handle, args_json)
+            }),
         )
         .await;
         match result {
@@ -7328,10 +7320,11 @@ impl mcpg_plugin_protocol::catalog::CatalogProvider for NativeCatalogProviderAda
         );
         let arg = abi_stable::std_types::RString::from(tool_id);
         let vtable_fn = self.vtable.describe;
-        let handle = SendHandle(self.handle);
         let result = tokio::time::timeout(
             self.library.ffi_limits.control_timeout,
-            tokio::task::spawn_blocking(move || vtable_fn(handle.ptr(), arg)),
+            ferry(Arc::clone(&self.instance), move |handle| {
+                vtable_fn(handle, arg)
+            }),
         )
         .await;
         match result {
@@ -7366,10 +7359,9 @@ impl mcpg_plugin_protocol::catalog::CatalogProvider for NativeCatalogProviderAda
             0,
         );
         let vtable_fn = self.vtable.list_catalog;
-        let handle = SendHandle(self.handle);
         let result = tokio::time::timeout(
             self.library.ffi_limits.data_timeout,
-            tokio::task::spawn_blocking(move || vtable_fn(handle.ptr())),
+            ferry(Arc::clone(&self.instance), move |handle| vtable_fn(handle)),
         )
         .await;
         match result {
@@ -7388,7 +7380,7 @@ impl mcpg_plugin_protocol::catalog::CatalogProvider for NativeCatalogProviderAda
     }
 
     async fn shutdown(&self) {
-        guard_ffi_drop(|| (self.vtable.shutdown)(self.handle));
+        guard_ffi_drop(|| (self.vtable.shutdown)(self.instance.ptr()));
     }
 }
 
@@ -7466,10 +7458,9 @@ struct ClusterPubSubFfi {
         EventSinkRef,
     ) -> mcpg_plugin_protocol::abi::StreamHandle,
     cancel_stream: extern "C" fn(RPluginHandle, usize),
-    handle: RPluginHandle,
     plugin_id: String,
     /// Keeps the plugin instance (and cdylib) alive for the bus's life.
-    _instance: Arc<NativeClusterInstance>,
+    instance: Arc<NativeInstance>,
 }
 
 unsafe impl Send for ClusterPubSubFfi {}
@@ -7491,11 +7482,12 @@ impl ClusterPubSubFfi {
         );
         let args_json = abi_stable::std_types::RString::from(args_str);
         let vt_fn = self.publish;
-        let handle = SendHandle(self.handle);
         let plugin_id = self.plugin_id.clone();
         let result = tokio::time::timeout(
             self.library.ffi_limits.data_timeout,
-            tokio::task::spawn_blocking(move || vt_fn(handle.ptr(), args_json)),
+            ferry(Arc::clone(&self.instance), move |handle| {
+                vt_fn(handle, args_json)
+            }),
         )
         .await;
         let raw = match result {
@@ -7551,10 +7543,11 @@ impl ClusterPubSubFfi {
         );
         let args_json = abi_stable::std_types::RString::from(args_str);
         let vt_fn = self.subscribe;
-        let handle = SendHandle(self.handle);
         let plugin_id = self.plugin_id.clone();
-        let spawn_result =
-            tokio::task::spawn_blocking(move || vt_fn(handle.ptr(), args_json, sink)).await;
+        let spawn_result = ferry(Arc::clone(&self.instance), move |handle| {
+            vt_fn(handle, args_json, sink)
+        })
+        .await;
         let result = match spawn_result {
             Ok(r) => r,
             Err(_) => {
@@ -7584,9 +7577,8 @@ impl ClusterPubSubFfi {
         }
         call.end_ok(resp_bytes);
         let guard = StreamCancelGuard {
-            library: Arc::clone(&self.library),
+            instance: Arc::clone(&self.instance),
             cancel_fn: self.cancel_stream,
-            plugin_handle: self.handle,
             watch_handle: result.handle,
             bridge_ptr: bridge_ptr.0,
         };
@@ -7699,7 +7691,6 @@ struct NativeClusterKv {
         RPluginHandle,
         abi_stable::std_types::RString,
     ) -> abi_stable::std_types::RString,
-    handle: RPluginHandle,
     plugin_id: String,
     /// The coordinator store of its own every call names, when not the
     /// shared one.
@@ -7712,7 +7703,7 @@ struct NativeClusterKv {
     /// Set once a listing came back unpaged, so the warning shows once.
     unpaged_warned: std::sync::atomic::AtomicBool,
     /// Keeps the plugin instance (and cdylib) alive for the KV's life.
-    _instance: Arc<NativeClusterInstance>,
+    instance: Arc<NativeInstance>,
 }
 
 unsafe impl Send for NativeClusterKv {}
@@ -7746,11 +7737,12 @@ impl NativeClusterKv {
         let call =
             crate::ffi_metering::FfiCall::begin(&self.plugin_id, "cluster", slot, args_str.len());
         let args_json = abi_stable::std_types::RString::from(args_str);
-        let handle = SendHandle(self.handle);
         let plugin_id = self.plugin_id.clone();
         let result = tokio::time::timeout(
             self.library.ffi_limits.data_timeout,
-            tokio::task::spawn_blocking(move || vt_fn(handle.ptr(), args_json)),
+            ferry(Arc::clone(&self.instance), move |handle| {
+                vt_fn(handle, args_json)
+            }),
         )
         .await;
         match result {
@@ -7960,38 +7952,9 @@ impl KeyValueStore for NativeClusterKv {
     }
 }
 
-/// Shared owner of the cluster plugin's instance handle + the vtable's
-/// `drop_instance` fn. Held via `Arc` by the `NativeClusterAdapter`
-/// AND by every outstanding `NativeLeaseHandle`, so the plugin instance is
-/// freed exactly once — only after the adapter AND all its leases drop. A
-/// `BoxActiveLease` can therefore never outlive the instance its
-/// `lease_*` ops dereference. The coordinator is a process-lifetime
-/// singleton today (so the adapter always outlives its leases in
-/// practice), making this a latent-UAF guard rather than an active fix —
-/// but it makes the lifetime sound under a future hot-reload /
-/// replaceable-registry / test teardown that drops the adapter while a
-/// lease (e.g. a held `ReloadPermit`) is still outstanding.
-struct NativeClusterInstance {
-    /// Keeps the cdylib mapped while the instance handle is live.
-    library: Arc<LoadedNativePlugin>,
-    handle: RPluginHandle,
-    drop_instance: extern "C" fn(RPluginHandle),
-}
-
-unsafe impl Send for NativeClusterInstance {}
-unsafe impl Sync for NativeClusterInstance {}
-
-impl Drop for NativeClusterInstance {
-    fn drop(&mut self) {
-        (self.drop_instance)(self.handle);
-        let _ = &self.library;
-    }
-}
-
 pub struct NativeClusterAdapter {
     library: Arc<LoadedNativePlugin>,
     vtable: ClusterVTable,
-    handle: RPluginHandle,
     manifest: PluginManifest,
     /// The plugin's manifest declares [`KV_VALUE_BASE64`]: key/value values
     /// cross the boundary as base64 strings, not arrays of numbers.
@@ -8001,10 +7964,9 @@ pub struct NativeClusterAdapter {
     kv_incr_floor: bool,
     #[allow(dead_code)]
     alias: String,
-    _host_bridge: crate::host_bridge::HostBridge,
-    /// Shared instance owner — freeing the plugin instance is delegated
-    /// here so an outstanding lease can keep it alive.
-    instance: Arc<NativeClusterInstance>,
+    /// Shared with every lease, KV, bus and stream made from the
+    /// coordinator, so an outstanding one keeps the instance alive.
+    instance: Arc<NativeInstance>,
 }
 
 unsafe impl Send for NativeClusterAdapter {}
@@ -8020,7 +7982,7 @@ impl NativeClusterAdapter {
     /// consumer plugin.
     pub fn ffi_ref(&self) -> mcpg_plugin_protocol::abi::ClusterClientRef {
         mcpg_plugin_protocol::abi::ClusterClientRef {
-            handle: self.handle as usize,
+            handle: self.instance.ptr() as usize,
             vtable: self.vtable,
         }
     }
@@ -8050,13 +8012,12 @@ impl NativeClusterAdapter {
             kv_list_prefix: self.vtable.kv_list_prefix,
             kv_expire: self.vtable.kv_expire,
             kv_incr: self.vtable.kv_incr,
-            handle: self.handle,
             plugin_id: self.manifest.id.clone(),
             store: store.map(str::to_owned),
             values_base64: self.kv_value_base64,
             incr_floor: self.kv_incr_floor,
             unpaged_warned: std::sync::atomic::AtomicBool::new(false),
-            _instance: Arc::clone(&self.instance),
+            instance: Arc::clone(&self.instance),
         }) as Arc<dyn KeyValueStore>)
     }
 
@@ -8078,10 +8039,10 @@ impl NativeClusterAdapter {
         // "transient error means treat as supported" rule above, so an
         // unreachable coordinator is not permanently downgraded.
         let vtable_fn = self.vtable.kv_get;
-        let handle = SendHandle(self.handle);
         let raw = call_sync_vtable_bounded(
+            &self.instance,
             self.library.ffi_limits.data_timeout,
-            move || vtable_fn(handle.ptr(), args),
+            move |handle| vtable_fn(handle, args),
             abi_stable::std_types::RString::new,
         );
         let decoded = mcpg_plugin_protocol::result_envelope::decode_result_envelope::<
@@ -8101,9 +8062,8 @@ impl NativeClusterAdapter {
             publish: self.vtable.publish,
             subscribe: self.vtable.subscribe,
             cancel_stream: self.vtable.cancel_stream,
-            handle: self.handle,
             plugin_id: self.manifest.id.clone(),
-            _instance: Arc::clone(&self.instance),
+            instance: Arc::clone(&self.instance),
         }
     }
 
@@ -8111,7 +8071,7 @@ impl NativeClusterAdapter {
     /// macro-produced [`ClusterVTable`] + an already-`make`d instance
     /// `handle`, WITHOUT a dlopen. Drives the EXACT production dispatch
     /// path (`spawn_blocking`, JSON arg/result marshalling, result
-    /// envelopes, the refcounted [`NativeClusterInstance`], the
+    /// envelopes, the refcounted `NativeInstance`, the
     /// lease + stream-cancel guards) as [`Self::new`], but over an
     /// in-process vtable whose fn pointers live in the test binary.
     ///
@@ -8119,9 +8079,9 @@ impl NativeClusterAdapter {
     /// - `vtable`'s fn pointers + `handle` MUST stay valid for the
     ///   adapter's whole life (a macro-built vtable over a `'static`
     ///   plugin type satisfies this automatically).
-    /// - `vtable.drop_instance` is invoked exactly once when the adapter
-    ///   AND all outstanding leases drop; the macro emits a real
-    ///   `Box::from_raw` freeing impl.
+    /// - `vtable.drop_instance` is invoked exactly once when the adapter,
+    ///   all outstanding leases and all in-flight calls drop; the macro
+    ///   emits a real `Box::from_raw` freeing impl.
     /// - `manifest.id` must be non-empty (it is the FFI-metering label).
     ///
     /// The synthetic `LoadedNativePlugin` carries only default
@@ -8135,23 +8095,22 @@ impl NativeClusterAdapter {
         alias: String,
     ) -> Self {
         let library = Arc::new(LoadedNativePlugin::synthetic(manifest.clone()));
-        let instance = Arc::new(NativeClusterInstance {
-            library: Arc::clone(&library),
+        let instance = NativeInstance::new(
+            Arc::clone(&library),
             handle,
-            drop_instance: vtable.drop_instance,
-        });
+            vtable.drop_instance,
+            crate::host_bridge::HostBridge::stub(),
+        );
         let manifest_json = (vtable.manifest_json)(handle);
         let kv_value_base64 = declares_wire_feature(manifest_json.as_str(), KV_VALUE_BASE64);
         let kv_incr_floor = declares_wire_feature(manifest_json.as_str(), KV_INCR_FLOOR);
         Self {
             library,
             vtable,
-            handle,
             manifest,
             kv_value_base64,
             kv_incr_floor,
             alias,
-            _host_bridge: crate::host_bridge::HostBridge::stub(),
             instance,
         }
     }
@@ -8218,23 +8177,18 @@ impl NativeClusterAdapter {
         let kv_value_base64 = declares_wire_feature(manifest_json.as_str(), KV_VALUE_BASE64);
         let kv_incr_floor = declares_wire_feature(manifest_json.as_str(), KV_INCR_FLOOR);
         // From here on the instance handle is owned by a refcounted
-        // `NativeClusterInstance`, NOT the adapter's `Drop`. Any failure
-        // ABOVE this point still frees `handle` inline (the plugin owns
-        // nothing the host shares yet); below, the Arc owns the free.
-        let instance = Arc::new(NativeClusterInstance {
-            library: Arc::clone(&library),
-            handle,
-            drop_instance: vt.drop_instance,
-        });
+        // `NativeInstance`. Any failure ABOVE this point still frees
+        // `handle` inline (the plugin owns nothing the host shares yet);
+        // below, the Arc owns the free.
+        let instance =
+            NativeInstance::new(Arc::clone(&library), handle, vt.drop_instance, host_bridge);
         Ok(Self {
             library,
             vtable: vt,
-            handle,
             manifest,
             kv_value_base64,
             kv_incr_floor,
             alias,
-            _host_bridge: host_bridge,
             instance,
         })
     }
@@ -8256,9 +8210,11 @@ impl NativeClusterAdapter {
         let call =
             crate::ffi_metering::FfiCall::begin(&self.manifest.id, "cluster", slot, args_str.len());
         let args_json = abi_stable::std_types::RString::from(args_str);
-        let handle = SendHandle(self.handle);
         let plugin_id = self.manifest.id.clone();
-        let result = tokio::task::spawn_blocking(move || vtable_fn(handle.ptr(), args_json)).await;
+        let result = ferry(Arc::clone(&self.instance), move |handle| {
+            vtable_fn(handle, args_json)
+        })
+        .await;
         let result = match result {
             Ok(r) => r,
             Err(_) => {
@@ -8282,16 +8238,14 @@ impl NativeClusterAdapter {
         }
         call.end_ok(result.error_json.len());
         Ok(Box::new(NativeLeaseHandle {
-            library: Arc::clone(&self.library),
             lease_renew: self.vtable.lease_renew,
             lease_release: self.vtable.lease_release,
             lease_drop: self.vtable.lease_drop,
-            plugin_handle: self.handle,
             lease_handle: result.handle,
             fencing_token: result.fencing_token,
             expires_at: std::sync::Mutex::new(result.expires_at.as_str().to_owned()),
             plugin_id: plugin_id.clone(),
-            _instance: Arc::clone(&self.instance),
+            instance: Arc::clone(&self.instance),
         }))
     }
 
@@ -8311,9 +8265,11 @@ impl NativeClusterAdapter {
         let call =
             crate::ffi_metering::FfiCall::begin(&self.manifest.id, "cluster", slot, args_str.len());
         let args_json = abi_stable::std_types::RString::from(args_str);
-        let handle = SendHandle(self.handle);
         let plugin_id = self.manifest.id.clone();
-        let result = tokio::task::spawn_blocking(move || vtable_fn(handle.ptr(), args_json)).await;
+        let result = ferry(Arc::clone(&self.instance), move |handle| {
+            vtable_fn(handle, args_json)
+        })
+        .await;
         let result = match result {
             Ok(r) => r,
             Err(_) => {
@@ -8326,16 +8282,14 @@ impl NativeClusterAdapter {
         if result.handle != 0 {
             call.end_ok(result.error_json.len());
             return Ok(Some(Box::new(NativeLeaseHandle {
-                library: Arc::clone(&self.library),
                 lease_renew: self.vtable.lease_renew,
                 lease_release: self.vtable.lease_release,
                 lease_drop: self.vtable.lease_drop,
-                plugin_handle: self.handle,
                 lease_handle: result.handle,
                 fencing_token: result.fencing_token,
                 expires_at: std::sync::Mutex::new(result.expires_at.as_str().to_owned()),
                 plugin_id: plugin_id.clone(),
-                _instance: Arc::clone(&self.instance),
+                instance: Arc::clone(&self.instance),
             })));
         }
         if result.error_json.as_str().is_empty() {
@@ -8361,11 +8315,9 @@ impl NativeClusterAdapter {
 /// into the corresponding lease-op vtable slot + caches the
 /// fencing token and the most recent expires_at reply.
 pub struct NativeLeaseHandle {
-    library: Arc<LoadedNativePlugin>,
     lease_renew: extern "C" fn(RPluginHandle, usize) -> abi_stable::std_types::RString,
     lease_release: extern "C" fn(RPluginHandle, usize) -> abi_stable::std_types::RString,
     lease_drop: extern "C" fn(RPluginHandle, usize),
-    plugin_handle: RPluginHandle,
     lease_handle: usize,
     fencing_token: u64,
     expires_at: std::sync::Mutex<String>,
@@ -8376,7 +8328,7 @@ pub struct NativeLeaseHandle {
     /// the lease is outstanding, so the `lease_*` vtable calls below can
     /// never dereference a freed handle — even if the parent
     /// `NativeClusterAdapter` was dropped first.
-    _instance: Arc<NativeClusterInstance>,
+    instance: Arc<NativeInstance>,
 }
 
 unsafe impl Send for NativeLeaseHandle {}
@@ -8402,10 +8354,11 @@ impl ActiveLease for NativeLeaseHandle {
         let call =
             crate::ffi_metering::FfiCall::begin(&self.plugin_id, "cluster", "lease_renew", 0);
         let vtable_fn = self.lease_renew;
-        let plugin_handle = SendHandle(self.plugin_handle);
         let lease_handle = self.lease_handle;
-        let result =
-            tokio::task::spawn_blocking(move || vtable_fn(plugin_handle.ptr(), lease_handle)).await;
+        let result = ferry(Arc::clone(&self.instance), move |plugin_handle| {
+            vtable_fn(plugin_handle, lease_handle)
+        })
+        .await;
         let raw = match result {
             Ok(r) => r,
             Err(_) => {
@@ -8449,10 +8402,11 @@ impl ActiveLease for NativeLeaseHandle {
         let call =
             crate::ffi_metering::FfiCall::begin(&self.plugin_id, "cluster", "lease_release", 0);
         let vtable_fn = self.lease_release;
-        let plugin_handle = SendHandle(self.plugin_handle);
         let lease_handle = self.lease_handle;
-        let result =
-            tokio::task::spawn_blocking(move || vtable_fn(plugin_handle.ptr(), lease_handle)).await;
+        let result = ferry(Arc::clone(&self.instance), move |plugin_handle| {
+            vtable_fn(plugin_handle, lease_handle)
+        })
+        .await;
         let raw = match result {
             Ok(r) => r,
             Err(_) => {
@@ -8491,19 +8445,17 @@ impl ActiveLease for NativeLeaseHandle {
 impl Drop for NativeLeaseHandle {
     fn drop(&mut self) {
         // Best-effort cleanup — plugin can choose to ignore if
-        // release already ran. The `library` Arc keeps the
-        // cdylib alive until the drop completes.
-        (self.lease_drop)(self.plugin_handle, self.lease_handle);
-        let _ = &self.library;
+        // release already ran. The `instance` Arc keeps the instance
+        // and the cdylib alive until the drop completes.
+        (self.lease_drop)(self.instance.ptr(), self.lease_handle);
     }
 }
 
 // No explicit `Drop` — freeing the plugin instance is delegated to
-// the refcounted `instance: Arc<NativeClusterInstance>` field, whose own
-// `Drop` runs `drop_instance` only once the adapter AND every outstanding
-// `NativeLeaseHandle` (each holding an `Arc` clone) have dropped. A held
-// lease therefore keeps the instance — and the cdylib — alive past the
-// adapter, closing the latent use-after-free.
+// the refcounted `instance: Arc<NativeInstance>` field, whose own
+// `Drop` runs `drop_instance` only once the adapter, every outstanding
+// `NativeLeaseHandle` and every in-flight call (each holding an `Arc`
+// clone) have dropped.
 
 #[async_trait]
 impl ClusterBackend for NativeClusterAdapter {
@@ -8535,11 +8487,10 @@ impl ClusterBackend for NativeClusterAdapter {
 
     async fn node_info(&self) -> ClusterNodeInfo {
         let vt_fn = self.vtable.node_info;
-        let handle = SendHandle(self.handle);
         let plugin_id = self.manifest.id.clone();
         let result = tokio::time::timeout(
             self.library.ffi_limits.control_timeout,
-            tokio::task::spawn_blocking(move || vt_fn(handle.ptr())),
+            ferry(Arc::clone(&self.instance), move |handle| vt_fn(handle)),
         )
         .await;
         let raw = match result {
@@ -8565,10 +8516,9 @@ impl ClusterBackend for NativeClusterAdapter {
 
     async fn list_peers(&self) -> Vec<ClusterPeer> {
         let vt_fn = self.vtable.list_peers;
-        let handle = SendHandle(self.handle);
         let result = tokio::time::timeout(
             self.library.ffi_limits.control_timeout,
-            tokio::task::spawn_blocking(move || vt_fn(handle.ptr())),
+            ferry(Arc::clone(&self.instance), move |handle| vt_fn(handle)),
         )
         .await;
         let raw = match result {
@@ -8588,9 +8538,11 @@ impl ClusterBackend for NativeClusterAdapter {
         let (bridge_ptr_raw, sink, rx) = make_stream_bridge(&self.manifest.id);
         let bridge_ptr = SendPtr(bridge_ptr_raw);
         let vtable_fn = self.vtable.watch_peers;
-        let handle = SendHandle(self.handle);
         let plugin_id = self.manifest.id.clone();
-        let spawn_result = tokio::task::spawn_blocking(move || vtable_fn(handle.ptr(), sink)).await;
+        let spawn_result = ferry(Arc::clone(&self.instance), move |handle| {
+            vtable_fn(handle, sink)
+        })
+        .await;
         let result = match spawn_result {
             Ok(r) => r,
             Err(_) => {
@@ -8616,9 +8568,8 @@ impl ClusterBackend for NativeClusterAdapter {
             return empty_peer_event_stream();
         }
         let guard = StreamCancelGuard {
-            library: Arc::clone(&self.library),
+            instance: Arc::clone(&self.instance),
             cancel_fn: self.vtable.cancel_stream,
-            plugin_handle: self.handle,
             watch_handle: result.handle,
             bridge_ptr: bridge_ptr.0,
         };
@@ -8701,11 +8652,12 @@ impl ClusterBackend for NativeClusterAdapter {
         );
         let args_json = abi_stable::std_types::RString::from(args_str);
         let vt_fn = self.vtable.publish;
-        let handle = SendHandle(self.handle);
         let plugin_id = self.manifest.id.clone();
         let result = tokio::time::timeout(
             self.library.ffi_limits.data_timeout,
-            tokio::task::spawn_blocking(move || vt_fn(handle.ptr(), args_json)),
+            ferry(Arc::clone(&self.instance), move |handle| {
+                vt_fn(handle, args_json)
+            }),
         )
         .await;
         let raw = match result {
@@ -8765,10 +8717,11 @@ impl ClusterBackend for NativeClusterAdapter {
         );
         let args_json = abi_stable::std_types::RString::from(args_str);
         let vtable_fn = self.vtable.subscribe;
-        let handle = SendHandle(self.handle);
         let plugin_id = self.manifest.id.clone();
-        let spawn_result =
-            tokio::task::spawn_blocking(move || vtable_fn(handle.ptr(), args_json, sink)).await;
+        let spawn_result = ferry(Arc::clone(&self.instance), move |handle| {
+            vtable_fn(handle, args_json, sink)
+        })
+        .await;
         let result = match spawn_result {
             Ok(r) => r,
             Err(_) => {
@@ -8798,9 +8751,8 @@ impl ClusterBackend for NativeClusterAdapter {
         }
         call.end_ok(resp_bytes);
         let guard = StreamCancelGuard {
-            library: Arc::clone(&self.library),
+            instance: Arc::clone(&self.instance),
             cancel_fn: self.vtable.cancel_stream,
-            plugin_handle: self.handle,
             watch_handle: result.handle,
             bridge_ptr: bridge_ptr.0,
         };
@@ -8808,7 +8760,7 @@ impl ClusterBackend for NativeClusterAdapter {
     }
 
     async fn shutdown(&self) {
-        guard_ffi_drop(|| (self.vtable.shutdown)(self.handle));
+        guard_ffi_drop(|| (self.vtable.shutdown)(self.instance.ptr()));
     }
 }
 
@@ -8903,12 +8855,11 @@ fn clone_transport(vt: &TransportVTable) -> TransportVTable {
 pub struct NativeTransportAdapter {
     library: Arc<LoadedNativePlugin>,
     vtable: TransportVTable,
-    handle: RPluginHandle,
+    instance: Arc<NativeInstance>,
     manifest: PluginManifest,
     name: String,
     #[allow(dead_code)]
     alias: String,
-    _host_bridge: crate::host_bridge::HostBridge,
 }
 
 unsafe impl Send for NativeTransportAdapter {}
@@ -8978,14 +8929,15 @@ impl NativeTransportAdapter {
             return Err(anyhow!("native transport plugin returned empty name"));
         }
         let name = name_rstr.as_str().to_owned();
+        let instance =
+            NativeInstance::new(Arc::clone(&library), handle, vt.drop_instance, host_bridge);
         Ok(Self {
             library,
             vtable: vt,
-            handle,
+            instance,
             manifest,
             name,
             alias,
-            _host_bridge: host_bridge,
         })
     }
 
@@ -9025,11 +8977,10 @@ impl NativeTransportAdapter {
             }
         };
         Ok(Box::new(NativeTransportHandle {
-            library: Arc::clone(&self.library),
+            instance: Arc::clone(&self.instance),
             close_fn: self.vtable.transport_handle_close,
             drop_fn: self.vtable.transport_handle_drop,
             listen_address_fn: self.vtable.transport_handle_listen_address,
-            plugin_handle: self.handle,
             transport_handle: result.handle,
             bridge: Some(bridge),
             cached_listen_address: std::sync::Mutex::new(listen_address),
@@ -9046,13 +8997,6 @@ impl TransportBridge {
     unsafe fn release(self) {
         // SAFETY: from `HttpServerBridge::into_owner`; the caller's contract.
         unsafe { crate::http_ingress_bridge::HttpServerBridge::release(self.0) };
-    }
-}
-
-impl Drop for NativeTransportAdapter {
-    fn drop(&mut self) {
-        guard_ffi_drop(|| (self.vtable.drop_instance)(self.handle));
-        let _ = &self.library;
     }
 }
 
@@ -9089,11 +9033,11 @@ impl Transport for NativeTransportAdapter {
         );
         let config_json = abi_stable::std_types::RString::from(config_str);
         let vtable_fn = self.vtable.start_http;
-        let handle = SendHandle(self.handle);
         let plugin_id = self.manifest.id.clone();
-        let spawn_result =
-            tokio::task::spawn_blocking(move || vtable_fn(handle.ptr(), config_json, server_ref))
-                .await;
+        let spawn_result = ferry(Arc::clone(&self.instance), move |handle| {
+            vtable_fn(handle, config_json, server_ref)
+        })
+        .await;
         let bridge = TransportBridge(owner_ptr.0);
         let Ok(result) = spawn_result else {
             call.end_err(0);
@@ -9107,16 +9051,16 @@ impl Transport for NativeTransportAdapter {
     }
 
     async fn shutdown(&self) {
-        guard_ffi_drop(|| (self.vtable.shutdown)(self.handle));
+        guard_ffi_drop(|| (self.vtable.shutdown)(self.instance.ptr()));
     }
 }
 
 pub struct NativeTransportHandle {
-    library: Arc<LoadedNativePlugin>,
+    /// Keeps the plugin instance alive while the transport runs.
+    instance: Arc<NativeInstance>,
     close_fn: extern "C" fn(RPluginHandle, usize),
     drop_fn: extern "C" fn(RPluginHandle, usize),
     listen_address_fn: extern "C" fn(RPluginHandle, usize) -> abi_stable::std_types::RString,
-    plugin_handle: RPluginHandle,
     transport_handle: usize,
     bridge: Option<TransportBridge>,
     cached_listen_address: std::sync::Mutex<Option<String>>,
@@ -9136,10 +9080,11 @@ impl TransportHandle for NativeTransportHandle {
             return guard.clone();
         }
         let vt_fn = self.listen_address_fn;
-        let plugin_handle = SendHandle(self.plugin_handle);
         let transport_handle = self.transport_handle;
-        let result =
-            tokio::task::spawn_blocking(move || vt_fn(plugin_handle.ptr(), transport_handle)).await;
+        let result = ferry(Arc::clone(&self.instance), move |plugin_handle| {
+            vt_fn(plugin_handle, transport_handle)
+        })
+        .await;
         let raw = match result {
             Ok(r) => r,
             Err(_) => return None,
@@ -9153,24 +9098,24 @@ impl TransportHandle for NativeTransportHandle {
 
     async fn close(&self) {
         let vt_fn = self.close_fn;
-        let plugin_handle = SendHandle(self.plugin_handle);
         let transport_handle = self.transport_handle;
-        let _ =
-            tokio::task::spawn_blocking(move || vt_fn(plugin_handle.ptr(), transport_handle)).await;
+        let _ = ferry(Arc::clone(&self.instance), move |plugin_handle| {
+            vt_fn(plugin_handle, transport_handle)
+        })
+        .await;
     }
 }
 
 impl Drop for NativeTransportHandle {
     fn drop(&mut self) {
         // Tell plugin to free its transport state.
-        (self.drop_fn)(self.plugin_handle, self.transport_handle);
+        (self.drop_fn)(self.instance.ptr(), self.transport_handle);
         // Plugin MUST NOT call the bridge after transport_handle_drop
         // returns — contract of the vtable.
         if let Some(bridge) = self.bridge.take() {
             // SAFETY: the plugin's transport_handle_drop returned above.
             unsafe { bridge.release() };
         }
-        let _ = &self.library;
     }
 }
 
@@ -9640,5 +9585,306 @@ provides_schemes: []
             .expect_err("no entities to probe, so this errors — but not on parsing");
         let msg = format!("{err:#}");
         assert!(msg.contains("exports no entities"), "got: {msg}");
+    }
+}
+
+#[cfg(test)]
+mod ferry_lifetime_tests {
+    use super::*;
+    use abi_stable::std_types::{ROption, RStr, RString};
+    use mcpg_plugin_protocol::abi::{HostHandleRef, RGateDecision};
+    use mcpg_plugin_protocol::manifest::PluginClass;
+    use mcpg_plugin_protocol::types::PluginIdentity;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Condvar, Mutex, PoisonError};
+    use std::time::Duration;
+
+    /// What one probe plugin instance records. Its `make` slot returns the
+    /// address of the probe as the instance handle.
+    #[derive(Default)]
+    struct Probe {
+        entered: AtomicBool,
+        in_slot: AtomicBool,
+        released: Mutex<bool>,
+        release: Condvar,
+        destroyed: AtomicUsize,
+        destroyed_in_slot: AtomicUsize,
+    }
+
+    impl Probe {
+        /// The body of a blocking slot: it returns once the test releases it.
+        fn block(&self) {
+            self.in_slot.store(true, Ordering::SeqCst);
+            self.entered.store(true, Ordering::SeqCst);
+            let mut released = self.released.lock().unwrap_or_else(PoisonError::into_inner);
+            while !*released {
+                released = self
+                    .release
+                    .wait(released)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+            drop(released);
+            self.in_slot.store(false, Ordering::SeqCst);
+        }
+
+        fn unblock(&self) {
+            *self.released.lock().unwrap_or_else(PoisonError::into_inner) = true;
+            self.release.notify_all();
+        }
+
+        fn destroyed(&self) -> usize {
+            self.destroyed.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Releases the slot when the test ends, also on a failed assertion, so
+    /// the runtime never waits on a blocked thread.
+    struct Unblock(Arc<Probe>);
+
+    impl Drop for Unblock {
+        fn drop(&mut self) {
+            self.0.unblock();
+        }
+    }
+
+    fn probe<'a>(handle: RPluginHandle) -> &'a Probe {
+        // SAFETY: `probe_make` returns the address of a `Probe` that the test
+        // keeps alive past every slot call.
+        unsafe { &*(handle as *const Probe) }
+    }
+
+    extern "C" fn probe_make(
+        _host: HostHandleRef,
+        config_json: RString,
+        _inner_name: RString,
+    ) -> RPluginHandle {
+        serde_json::from_str::<serde_json::Value>(config_json.as_str())
+            .ok()
+            .and_then(|config| config["probe"].as_u64())
+            .map_or(std::ptr::null_mut(), |address| {
+                address as usize as RPluginHandle
+            })
+    }
+
+    fn probe_manifest(class: PluginClass) -> PluginManifest {
+        PluginManifest {
+            id: "test.ferry-probe".into(),
+            version: "0.0.1".into(),
+            name: "ferry probe".into(),
+            plugin_class: class,
+            protocol_version: "1.0".into(),
+            license: None,
+            required_capabilities: Vec::new(),
+            tags: Vec::new(),
+            provides: Vec::new(),
+            provides_schemes: Vec::new(),
+            module_path_prefix: String::new(),
+            backend_profile: None,
+        }
+    }
+
+    fn manifest_json(class: PluginClass) -> RString {
+        RString::from(serde_json::to_string(&probe_manifest(class)).unwrap_or_default())
+    }
+
+    extern "C" fn gate_manifest(_handle: RPluginHandle) -> RString {
+        manifest_json(PluginClass::ToolGate)
+    }
+
+    extern "C" fn sink_manifest(_handle: RPluginHandle) -> RString {
+        manifest_json(PluginClass::AuditSink)
+    }
+
+    extern "C" fn probe_destroy(handle: RPluginHandle) {
+        let probe = probe(handle);
+        if probe.in_slot.load(Ordering::SeqCst) {
+            probe.destroyed_in_slot.fetch_add(1, Ordering::SeqCst);
+        }
+        probe.destroyed.fetch_add(1, Ordering::SeqCst);
+    }
+
+    extern "C" fn probe_shutdown(_handle: RPluginHandle) {}
+
+    fn allow() -> RGateDecision {
+        RGateDecision::Allow {
+            modified_arguments_json: ROption::RNone,
+            modified_result_json: ROption::RNone,
+            metadata_json: ROption::RNone,
+        }
+    }
+
+    extern "C" fn blocking_pre_dispatch(
+        handle: RPluginHandle,
+        _ctx: RPluginContext,
+        _arguments_json: RStr<'_>,
+        _meta_json: ROption<RStr<'_>>,
+        _config_json: RStr<'_>,
+    ) -> RGateDecision {
+        probe(handle).block();
+        allow()
+    }
+
+    extern "C" fn allow_post_dispatch(
+        _handle: RPluginHandle,
+        _ctx: RPluginContext,
+        _arguments_json: RStr<'_>,
+        _result_json: RStr<'_>,
+        _execution_duration_ms: u64,
+        _config_json: RStr<'_>,
+    ) -> RGateDecision {
+        allow()
+    }
+
+    extern "C" fn unused_emit(_handle: RPluginHandle, _event_json: RString) -> RString {
+        RString::new()
+    }
+
+    extern "C" fn blocking_flush(handle: RPluginHandle, _timeout_ms: u64) -> RString {
+        probe(handle).block();
+        RString::from(r#"{"ok":null}"#)
+    }
+
+    /// A synthetic library whose ferried calls time out after 50 ms.
+    fn library(class: PluginClass) -> Arc<LoadedNativePlugin> {
+        let mut library = LoadedNativePlugin::synthetic(probe_manifest(class));
+        library.ffi_limits.data_timeout = Duration::from_millis(50);
+        library.ffi_limits.control_timeout = Duration::from_millis(50);
+        Arc::new(library)
+    }
+
+    fn config(probe: &Arc<Probe>) -> serde_json::Value {
+        serde_json::json!({ "probe": Arc::as_ptr(probe) as usize })
+    }
+
+    fn services() -> Arc<dyn crate::host_services::HostServices> {
+        Arc::new(crate::host_services::NullHostServices)
+    }
+
+    fn context() -> PluginContext {
+        PluginContext {
+            request_id: "r-ferry".into(),
+            session_id: None,
+            tool_name: "probe".into(),
+            surface: "tool".into(),
+            identity: PluginIdentity {
+                kind: "anonymous".into(),
+                trust_level: "unauthenticated".into(),
+                subject_id: None,
+                auth_provider: None,
+                issuer: None,
+                roles: Vec::new(),
+                groups: Vec::new(),
+                scopes: Vec::new(),
+                attributes: std::collections::BTreeMap::new(),
+            },
+            transport: "http".into(),
+        }
+    }
+
+    /// Wait up to five seconds for `done`.
+    async fn wait_for(what: &str, done: impl Fn() -> bool) {
+        for _ in 0..1_000 {
+            if done() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    async fn wait_for_the_slot(probe: &Probe) {
+        wait_for("the slot to start", || probe.entered.load(Ordering::SeqCst)).await;
+    }
+
+    /// After the adapter is gone and its timed-out slot is still running,
+    /// the instance waits for the slot, then is destroyed exactly once.
+    async fn assert_destroyed_only_after_the_slot_returns(probe: &Probe) {
+        assert_eq!(
+            probe.destroyed(),
+            0,
+            "the instance was destroyed while its slot was still running"
+        );
+        probe.unblock();
+        wait_for("the instance to be destroyed", || probe.destroyed() > 0).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(probe.destroyed(), 1, "the instance is destroyed once");
+        assert_eq!(
+            probe.destroyed_in_slot.load(Ordering::SeqCst),
+            0,
+            "the instance is destroyed after its slot returned"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_timed_out_gate_call_keeps_its_instance_until_the_slot_returns() {
+        let probe = Arc::new(Probe::default());
+        let _unblock = Unblock(Arc::clone(&probe));
+        let vtable = ToolGateVTable {
+            make: probe_make,
+            manifest_json: gate_manifest,
+            evaluate_pre_dispatch: blocking_pre_dispatch,
+            evaluate_post_dispatch: allow_post_dispatch,
+            shutdown: probe_shutdown,
+            drop_instance: probe_destroy,
+        };
+        let adapter = NativeToolGateAdapter::new_for_entity(
+            library(PluginClass::ToolGate),
+            &vtable,
+            config(&probe),
+            "ferry-probe".into(),
+            services(),
+        )
+        .expect("the probe gate builds");
+
+        let decision = adapter
+            .evaluate_pre_dispatch(
+                &context(),
+                &serde_json::json!({}),
+                None,
+                &serde_json::json!({}),
+            )
+            .await;
+        assert!(
+            matches!(
+                decision,
+                GateDecision::Deny {
+                    http_status: 504,
+                    ..
+                }
+            ),
+            "a timed-out gate denies with 504: {decision:?}"
+        );
+
+        wait_for_the_slot(&probe).await;
+        drop(adapter);
+        assert_destroyed_only_after_the_slot_returns(&probe).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_timed_out_sink_flush_keeps_its_instance_until_the_slot_returns() {
+        let probe = Arc::new(Probe::default());
+        let _unblock = Unblock(Arc::clone(&probe));
+        let vtable = AuditSinkVTable {
+            make: probe_make,
+            manifest_json: sink_manifest,
+            emit: unused_emit,
+            flush: blocking_flush,
+            shutdown: probe_shutdown,
+            drop_instance: probe_destroy,
+        };
+        let adapter = NativeAuditSinkAdapter::new_for_entity(
+            library(PluginClass::AuditSink),
+            &vtable,
+            config(&probe),
+            "ferry-probe".into(),
+            services(),
+        )
+        .expect("the probe sink builds");
+
+        assert_eq!(adapter.flush(1_000).await, Err(AuditError::Timeout));
+
+        wait_for_the_slot(&probe).await;
+        drop(adapter);
+        assert_destroyed_only_after_the_slot_returns(&probe).await;
     }
 }

@@ -21,7 +21,7 @@ use mcpg_plugin_protocol::{
     WatchStrategyPlugin,
 };
 use tokio::time::timeout;
-use tracing::{Instrument, info, warn};
+use tracing::{Instrument, debug, info, warn};
 
 use crate::descriptor::validate_descriptor;
 use crate::lifecycle::{AtomicPluginState, PluginState};
@@ -6641,7 +6641,9 @@ impl PluginRegistry {
                 .await
             {
                 IdentityResolution::Resolved { identity } => {
-                    info!(
+                    // Every call's audit events carry the subject in
+                    // `actor.subject_id`.
+                    debug!(
                         plugin_id = %loaded.manifest.id,
                         subject_id = ?identity.subject_id,
                         "identity resolved by plugin"
