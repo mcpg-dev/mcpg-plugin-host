@@ -23,7 +23,7 @@
 //!    Issued / Revoked to the local cache.
 //!
 //! Result: at most one plugin call per
-//! `(identity_hash, plugin_id, target)` cluster-wide per
+//! `(identity_hash, plugin_id, target, config_hash)` cluster-wide per
 //! credential lifetime. Identity propagation works correctly in
 //! multi-instance deploys.
 //!
@@ -73,7 +73,9 @@ use mcpg_plugin_protocol::types::PluginIdentity;
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 
-use crate::credential_cache::{CredentialCache, RevocationCallback, RevocationSubscription};
+use crate::credential_cache::{
+    CredentialCache, RevocationCallback, RevocationSubscription, credential_config_hash,
+};
 use crate::credential_cache_cipher::{DecryptError, EventCipher};
 
 /// Default topic for credential cache events. Operators with
@@ -123,11 +125,17 @@ impl CredentialCacheKind {
     ) -> Result<IssuedCredential, CredentialError> {
         match self {
             Self::Local(c) => {
-                if let Some(cached) = c.try_get(identity, &issuer.manifest().id, target) {
+                if let Some(cached) = c.try_get(identity, &issuer.manifest().id, target, config) {
                     return Ok(cached);
                 }
                 let credential = issuer.issue(identity, target, config).await?;
-                c.insert_external(identity, &issuer.manifest().id, target, credential.clone());
+                c.insert_external(
+                    identity,
+                    &issuer.manifest().id,
+                    target,
+                    config,
+                    credential.clone(),
+                );
                 Ok(credential)
             }
             Self::Clustered(c) => c.get_or_issue(issuer, identity, target, config).await,
@@ -173,12 +181,19 @@ impl CredentialCacheKind {
 pub enum CacheEvent {
     /// A peer instance issued a credential. Subscribers populate
     /// their local cache with the bundled credential so future
-    /// requests for `(identity_hash, plugin_id, target)` skip the
-    /// plugin call.
+    /// requests for `(identity_hash, plugin_id, target, config_hash)`
+    /// skip the plugin call.
     Issued {
         identity_hash: String,
         plugin_id: String,
         target: String,
+        /// [`credential_config_hash`] of the per-call config the
+        /// credential was issued for. `#[serde(default)]` → an event from
+        /// a publisher that does not key by config deserializes to "",
+        /// which the receiver drops: its credential may belong to any
+        /// per-call config, such as another RFC 8707 resource.
+        #[serde(default)]
+        config_hash: String,
         credential: IssuedCredential,
         /// node_id of the publisher. Receivers compare against
         /// their own `node_id` to skip self-publishes.
@@ -204,7 +219,8 @@ pub enum CacheEvent {
     },
     /// A peer instance invalidated a credential (binding signaled
     /// auth-failure, sweeper revoked, plugin shutdown). Subscribers
-    /// drop the matching entry from their local cache.
+    /// drop the matching entries, of every per-call config, from their
+    /// local cache.
     Revoked {
         identity_hash: String,
         plugin_id: String,
@@ -431,15 +447,18 @@ impl ClusteredCredentialCache {
         // Optimistic local-first lookup. If a peer instance has
         // already issued + published, our local cache is already
         // populated.
-        if let Some(cached) = self.local.try_get(identity, &issuer.manifest().id, target) {
+        if let Some(cached) = self
+            .local
+            .try_get(identity, &issuer.manifest().id, target, config)
+        {
             return Ok(cached);
         }
         // Local miss: issue fresh, insert locally, publish.
         let credential = issuer.issue(identity, target, config).await?;
         let plugin_id = issuer.manifest().id.clone();
         self.local
-            .insert_external(identity, &plugin_id, target, credential.clone());
-        self.publish_issued(identity, &plugin_id, target, &credential)
+            .insert_external(identity, &plugin_id, target, config, credential.clone());
+        self.publish_issued(identity, &plugin_id, target, config, &credential)
             .await;
         Ok(credential)
     }
@@ -469,12 +488,14 @@ impl ClusteredCredentialCache {
         identity: &PluginIdentity,
         plugin_id: &str,
         target: &str,
+        config: &serde_json::Value,
         credential: &IssuedCredential,
     ) {
         let event = CacheEvent::Issued {
             identity_hash: identity_hash_with_attrs(identity, self.local.key_attributes()),
             plugin_id: plugin_id.to_owned(),
             target: target.to_owned(),
+            config_hash: credential_config_hash(config),
             credential: credential.clone(),
             published_by: self.node_id.clone(),
             published_at_ms: now_unix_millis(),
@@ -775,6 +796,7 @@ fn apply_event(
             identity_hash: id_hash,
             plugin_id,
             target,
+            config_hash,
             credential,
             published_by,
             published_at_ms: _,
@@ -801,10 +823,24 @@ fn apply_event(
             ) {
                 return;
             }
+            if config_hash.is_empty() {
+                metrics::counter!(
+                    "mcpg_credential_cache_cluster_events_total",
+                    "kind" => "issued",
+                    "outcome" => "dropped_no_config_hash",
+                )
+                .increment(1);
+                tracing::debug!(
+                    published_by = %published_by,
+                    "credential cache subscriber: dropping Issued event without a \
+                     config_hash (publisher does not key by per-call config)",
+                );
+                return;
+            }
             if !accept_once(seen, &published_by, &event_id, "issued") {
                 return;
             }
-            local.insert_by_hash(id_hash, plugin_id, target, credential);
+            local.insert_by_hash(id_hash, plugin_id, target, config_hash, credential);
             metrics::counter!(
                 "mcpg_credential_cache_cluster_events_total",
                 "kind" => "issued",
@@ -892,6 +928,7 @@ mod tests {
             identity_hash: "abc123".into(),
             plugin_id: "vault-pg".into(),
             target: "orders-readonly".into(),
+            config_hash: "cfg".into(),
             credential: IssuedCredential::from_value("token-xyz", 60),
             published_by: "node-a".into(),
             published_at_ms: 0,
@@ -926,6 +963,7 @@ mod tests {
             identity_hash: "x".into(),
             plugin_id: "p".into(),
             target: "t".into(),
+            config_hash: "cfg".into(),
             credential: IssuedCredential::from_value("c", 60),
             published_by: "n".into(),
             published_at_ms: 0,
@@ -947,6 +985,7 @@ mod tests {
             identity_hash: "abc".into(),
             plugin_id: "vault-pg".into(),
             target: "orders".into(),
+            config_hash: "cfg".into(),
             credential: IssuedCredential::from_value("token-xyz", 60),
             published_by: "node-a".into(),
             published_at_ms: 0,
@@ -989,6 +1028,7 @@ mod tests {
             identity_hash: "h".into(),
             plugin_id: "p".into(),
             target: "t".into(),
+            config_hash: "cfg".into(),
             credential: IssuedCredential::from_value("c", 60),
             published_by: "other-node".into(),
             published_at_ms: ts,
@@ -1019,6 +1059,7 @@ mod tests {
             identity_hash: "h".into(),
             plugin_id: "p".into(),
             target: target.into(),
+            config_hash: "cfg".into(),
             credential: IssuedCredential::from_value("c", 60),
             published_by: by.into(),
             published_at_ms: now_unix_millis(),
@@ -1068,6 +1109,7 @@ mod tests {
             "h".into(),
             "p".into(),
             "t".into(),
+            "cfg".into(),
             IssuedCredential::from_value("c", 60),
         );
         apply_event(&local, "self", &[], &seen, revoked());
@@ -1078,6 +1120,7 @@ mod tests {
             "h".into(),
             "p".into(),
             "t".into(),
+            "cfg".into(),
             IssuedCredential::from_value("c2", 60),
         );
         apply_event(&local, "self", &[], &seen, revoked());
@@ -1092,6 +1135,7 @@ mod tests {
             identity_hash: hash.into(),
             plugin_id: "p".into(),
             target: "t".into(),
+            config_hash: "cfg".into(),
             credential: IssuedCredential::from_value("c", 60),
             published_by: "peer".into(),
             published_at_ms: now_unix_millis(),
@@ -1120,6 +1164,7 @@ mod tests {
             "h".into(),
             "p".into(),
             "t".into(),
+            "cfg".into(),
             IssuedCredential::from_value("c", 60),
         );
         apply_event(&local, "self", &[], &seen, revoked());
@@ -1128,10 +1173,91 @@ mod tests {
             "h".into(),
             "p".into(),
             "t".into(),
+            "cfg".into(),
             IssuedCredential::from_value("c2", 60),
         );
         apply_event(&local, "self", &[], &seen, revoked());
         assert!(local.is_empty(), "empty-id revoke is not deduplicated");
+    }
+
+    #[test]
+    fn apply_event_keeps_peer_credentials_per_config_and_revokes_them_together() {
+        let local = test_cache();
+        let seen = test_seen();
+        let identity = PluginIdentity {
+            kind: "anonymous".into(),
+            trust_level: "unauthenticated".into(),
+            subject_id: None,
+            auth_provider: None,
+            issuer: None,
+            roles: vec![],
+            groups: vec![],
+            scopes: vec![],
+            attributes: std::collections::BTreeMap::new(),
+        };
+        let id_hash = identity_hash_with_attrs(&identity, local.key_attributes());
+        let a = serde_json::json!({ "resource": "https://a.example.com/mcp" });
+        let b = serde_json::json!({ "resource": "https://b.example.com/mcp" });
+        let issued = |config: &serde_json::Value, token: &str, id: &str| CacheEvent::Issued {
+            identity_hash: id_hash.clone(),
+            plugin_id: "p".into(),
+            target: "t".into(),
+            config_hash: credential_config_hash(config),
+            credential: IssuedCredential::from_value(token, 60),
+            published_by: "peer".into(),
+            published_at_ms: now_unix_millis(),
+            event_id: id.into(),
+        };
+        apply_event(&local, "self", &[], &seen, issued(&a, "tok-a", "E1"));
+        apply_event(&local, "self", &[], &seen, issued(&b, "tok-b", "E2"));
+        assert_eq!(local.len(), 2, "one entry per resource");
+        let value = |config: &serde_json::Value| {
+            local
+                .try_get(&identity, "p", "t", config)
+                .and_then(|c| c.value)
+        };
+        assert_eq!(value(&a).as_deref(), Some("tok-a"));
+        assert_eq!(value(&b).as_deref(), Some("tok-b"));
+
+        let revoked = CacheEvent::Revoked {
+            identity_hash: id_hash.clone(),
+            plugin_id: "p".into(),
+            target: "t".into(),
+            published_by: "peer".into(),
+            published_at_ms: now_unix_millis(),
+            event_id: "E3".into(),
+        };
+        apply_event(&local, "self", &[], &seen, revoked);
+        assert!(
+            local.is_empty(),
+            "a revoke drops every config of the target"
+        );
+    }
+
+    #[test]
+    fn apply_event_drops_an_issued_event_without_a_config_hash() {
+        // A publisher that does not key by per-call config sends no
+        // `config_hash`; its credential may belong to another resource.
+        let local = test_cache();
+        let seen = test_seen();
+        let mut value = serde_json::to_value(CacheEvent::Issued {
+            identity_hash: "h".into(),
+            plugin_id: "p".into(),
+            target: "t".into(),
+            config_hash: "cfg".into(),
+            credential: IssuedCredential::from_value("c", 60),
+            published_by: "old-peer".into(),
+            published_at_ms: now_unix_millis(),
+            event_id: "E1".into(),
+        })
+        .unwrap();
+        value.as_object_mut().unwrap().remove("config_hash");
+        let event: CacheEvent = serde_json::from_value(value).unwrap();
+        apply_event(&local, "self", &[], &seen, event);
+        assert!(
+            local.is_empty(),
+            "an unkeyed peer credential must not apply"
+        );
     }
 
     #[test]
@@ -1164,6 +1290,7 @@ mod tests {
             identity_hash: "h".into(),
             plugin_id: "p".into(),
             target: "t".into(),
+            config_hash: "cfg".into(),
             credential: IssuedCredential::from_value("c", 60),
             published_by: "node".into(),
             published_at_ms: 7,
@@ -1182,6 +1309,7 @@ mod tests {
             identity_hash: "h".into(),
             plugin_id: "p".into(),
             target: "t".into(),
+            config_hash: "cfg".into(),
             credential: IssuedCredential::from_value("c", 60),
             published_by: "n".into(),
             published_at_ms: 0,

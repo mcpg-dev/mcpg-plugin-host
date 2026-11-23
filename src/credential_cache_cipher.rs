@@ -341,6 +341,7 @@ mod tests {
             identity_hash: "abc123".into(),
             plugin_id: "vault-pg".into(),
             target: "orders-readonly".into(),
+            config_hash: "cfg".into(),
             credential: IssuedCredential::from_value("token-xyz", 60),
             published_by: "node-a".into(),
             published_at_ms: 0,

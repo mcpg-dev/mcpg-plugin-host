@@ -1,11 +1,18 @@
-//! Per-`(identity_hash, plugin_id, target)` credential cache.
+//! Per-`(identity_hash, plugin_id, target, config_hash)` credential cache.
 //!
 //! Caches `IssuedCredential` values returned by `credential_issuer`
 //! plugins. Vault dynamic-DB issuance takes ~50-200ms; AWS STS
 //! AssumeRole takes ~50-100ms. Without caching, every MCP request
 //! adds that latency to every backend call. The cache keeps
-//! steady-state cost at one issuance per (caller, target) pair per
-//! credential lifetime.
+//! steady-state cost at one issuance per (caller, target, per-call
+//! config) per credential lifetime.
+//!
+//! The per-call config is part of the key because the issuer may mint
+//! a different credential for it: an OAuth issuer requests a token for
+//! the config's RFC 8707 `resource`, so two upstreams that share a
+//! provider must not share a token. Invalidation matches every config
+//! of an `(identity, plugin, target)`, since the callers that revoke do
+//! not hold the per-call config.
 //!
 //! # Eviction
 //!
@@ -41,12 +48,76 @@ use mcpg_plugin_protocol::types::PluginIdentity;
 /// of stable identity fields (subject_id, roles, scopes, etc.) —
 /// excludes `attributes` to bound cardinality. `plugin_id` is the
 /// `credential_issuer` manifest id. `target` is the operator-
-/// supplied target string from the `cred://` URI.
+/// supplied target string from the `cred://` URI. `config_hash` is
+/// [`credential_config_hash`] of the per-call issuer config.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct CacheKey {
     identity_hash: String,
     plugin_id: String,
     target: String,
+    config_hash: String,
+}
+
+impl CacheKey {
+    /// Whether this key belongs to `(identity_hash, plugin_id, target)`,
+    /// whatever its per-call config.
+    fn matches(&self, identity_hash: &str, plugin_id: &str, target: &str) -> bool {
+        self.identity_hash == identity_hash && self.plugin_id == plugin_id && self.target == target
+    }
+}
+
+/// Deterministic hash of a per-call issuer config, the cache-key
+/// dimension that keeps credentials issued for different per-call
+/// inputs (such as an RFC 8707 `resource`) apart. Object keys are fed
+/// sorted, so the hash does not depend on map insertion order. Never
+/// empty: an empty `config_hash` on a cluster event marks a publisher
+/// that does not key by config.
+#[must_use]
+pub fn credential_config_hash(config: &serde_json::Value) -> String {
+    use serde_json::Value;
+    use sha2::{Digest, Sha256};
+
+    fn feed_str(h: &mut Sha256, s: &str) {
+        h.update((s.len() as u64).to_le_bytes());
+        h.update(s.as_bytes());
+    }
+
+    fn feed(h: &mut Sha256, value: &Value) {
+        match value {
+            Value::Null => h.update([0u8]),
+            Value::Bool(b) => h.update([1u8, u8::from(*b)]),
+            Value::Number(n) => {
+                h.update([2u8]);
+                feed_str(h, &n.to_string());
+            }
+            Value::String(s) => {
+                h.update([3u8]);
+                feed_str(h, s);
+            }
+            Value::Array(items) => {
+                h.update([4u8]);
+                h.update((items.len() as u64).to_le_bytes());
+                for item in items {
+                    feed(h, item);
+                }
+            }
+            Value::Object(map) => {
+                h.update([5u8]);
+                h.update((map.len() as u64).to_le_bytes());
+                let mut entries: Vec<_> = map.iter().collect();
+                entries.sort_by(|a, b| a.0.cmp(b.0));
+                for (key, item) in entries {
+                    feed_str(h, key);
+                    feed(h, item);
+                }
+            }
+        }
+    }
+
+    let mut h = Sha256::new();
+    h.update(b"mcpg.credential_config_hash.v1\0");
+    feed(&mut h, config);
+    hex::encode(h.finalize())
 }
 
 #[derive(Debug, Clone)]
@@ -61,7 +132,7 @@ struct CachedEntry {
 /// Operator-supplied cache config. All fields have safe defaults.
 #[derive(Debug, Clone)]
 pub struct CredentialCacheConfig {
-    /// Maximum number of (identity, plugin, target) entries. When
+    /// Maximum number of (identity, plugin, target, config) entries. When
     /// the cache is full, the LRU entry is evicted. Default 10000
     /// — at ~500 bytes per entry that's ~5MB worst case.
     pub max_entries: usize,
@@ -210,8 +281,38 @@ impl CredentialCache {
         }
     }
 
+    /// Drop every entry of `(identity_hash, plugin_id, target)`, whatever
+    /// its per-call config, and fire the subscribers once.
+    fn invalidate_matching(&self, identity_hash: &str, plugin_id: &str, target: &str) {
+        // Fire subscribers WHILE holding the lock: a concurrent
+        // `host_unsubscribe` (RevocationSubscription::drop) needs this same
+        // lock to deregister, so it cannot return — and the plugin cannot
+        // free the FFI callback context — until any in-flight fire here has
+        // finished. Callbacks must be short and non-reentrant.
+        let mut guard = self.inner.lock().expect("credential cache mutex poisoned");
+        guard
+            .entries
+            .retain(|k, _| !k.matches(identity_hash, plugin_id, target));
+        Self::notify_revoked(&guard.subscribers, plugin_id, target);
+    }
+
+    fn key(
+        &self,
+        identity: &PluginIdentity,
+        plugin_id: &str,
+        target: &str,
+        config: &serde_json::Value,
+    ) -> CacheKey {
+        CacheKey {
+            identity_hash: self.identity_hash(identity),
+            plugin_id: plugin_id.to_owned(),
+            target: target.to_owned(),
+            config_hash: credential_config_hash(config),
+        }
+    }
+
     /// Look up the credential cached for this `(identity, plugin,
-    /// target)` triple. Cache miss / expired → calls `issuer.issue`
+    /// target, config)`. Cache miss / expired → calls `issuer.issue`
     /// and stores the fresh credential before returning.
     pub async fn get_or_issue(
         &self,
@@ -220,11 +321,7 @@ impl CredentialCache {
         target: &str,
         config: &serde_json::Value,
     ) -> Result<IssuedCredential, CredentialError> {
-        let key = CacheKey {
-            identity_hash: self.identity_hash(identity),
-            plugin_id: issuer.manifest().id.clone(),
-            target: target.to_owned(),
-        };
+        let key = self.key(identity, &issuer.manifest().id, target, config);
         let now = Instant::now();
 
         // Fast path: cache hit + not expired.
@@ -254,21 +351,10 @@ impl CredentialCache {
     /// "this credential is invalid" (e.g. Postgres returned
     /// auth-failed) — the gateway invalidates so the next request
     /// re-issues. If the entry has a `lease_id`, the caller may
-    /// also want to call `issuer.revoke(lease_id)` separately.
+    /// also want to call `issuer.revoke(lease_id)` separately. Drops the
+    /// entries of every per-call config of the triple.
     pub fn invalidate(&self, identity: &PluginIdentity, plugin_id: &str, target: &str) {
-        let key = CacheKey {
-            identity_hash: self.identity_hash(identity),
-            plugin_id: plugin_id.to_owned(),
-            target: target.to_owned(),
-        };
-        // Fire subscribers WHILE holding the lock: a concurrent
-        // `host_unsubscribe` (RevocationSubscription::drop) needs this same
-        // lock to deregister, so it cannot return — and the plugin cannot
-        // free the FFI callback context — until any in-flight fire here has
-        // finished. Callbacks must be short and non-reentrant.
-        let mut guard = self.inner.lock().expect("credential cache mutex poisoned");
-        guard.entries.remove(&key);
-        Self::notify_revoked(&guard.subscribers, plugin_id, target);
+        self.invalidate_matching(&self.identity_hash(identity), plugin_id, target);
     }
 
     /// Drop every entry issued by `plugin_id`. Used at plugin
@@ -284,7 +370,7 @@ impl CredentialCache {
             .filter(|(k, _)| k.plugin_id == plugin_id)
             .map(|(_, v)| v.credential.clone())
             .collect();
-        let evicted_targets: Vec<String> = guard
+        let evicted_targets: std::collections::BTreeSet<String> = guard
             .entries
             .iter()
             .filter(|(k, _)| k.plugin_id == plugin_id)
@@ -311,50 +397,44 @@ impl CredentialCache {
         identity: &PluginIdentity,
         plugin_id: &str,
         target: &str,
+        config: &serde_json::Value,
         credential: IssuedCredential,
     ) {
-        let key = CacheKey {
-            identity_hash: self.identity_hash(identity),
-            plugin_id: plugin_id.to_owned(),
-            target: target.to_owned(),
-        };
+        let key = self.key(identity, plugin_id, target, config);
         self.insert(key, credential, Instant::now());
     }
 
-    /// Insert a credential by pre-computed identity_hash. Used by
-    /// the cluster-aware wrapper applying peer-published Issued
-    /// events — the publisher already serialised the
-    /// identity_hash, so we don't reconstruct a PluginIdentity to
-    /// recompute it.
+    /// Insert a credential by pre-computed identity and config hashes.
+    /// Used by the cluster-aware wrapper applying peer-published Issued
+    /// events — the publisher already serialised both hashes, so we
+    /// don't reconstruct a PluginIdentity to recompute them. An empty
+    /// `config_hash` is refused: such an entry cannot be told apart from
+    /// one issued for a different per-call config.
     pub fn insert_by_hash(
         &self,
         identity_hash: String,
         plugin_id: String,
         target: String,
+        config_hash: String,
         credential: IssuedCredential,
     ) {
+        if config_hash.is_empty() {
+            return;
+        }
         let key = CacheKey {
             identity_hash,
             plugin_id,
             target,
+            config_hash,
         };
         self.insert(key, credential, Instant::now());
     }
 
-    /// Invalidate a cache entry by pre-computed identity_hash.
-    /// Counterpart to [`Self::insert_by_hash`] — used by the
-    /// cluster-aware wrapper applying peer-published Revoked
-    /// events.
+    /// Invalidate the entries of a pre-computed identity_hash, for every
+    /// per-call config. Counterpart to [`Self::insert_by_hash`] — used by
+    /// the cluster-aware wrapper applying peer-published Revoked events.
     pub fn invalidate_by_hash(&self, identity_hash: &str, plugin_id: &str, target: &str) {
-        let key = CacheKey {
-            identity_hash: identity_hash.to_owned(),
-            plugin_id: plugin_id.to_owned(),
-            target: target.to_owned(),
-        };
-        // Fire under the lock — see the note on `invalidate`.
-        let mut guard = self.inner.lock().expect("credential cache mutex poisoned");
-        guard.entries.remove(&key);
-        Self::notify_revoked(&guard.subscribers, plugin_id, target);
+        self.invalidate_matching(identity_hash, plugin_id, target);
     }
 
     /// Local-only lookup — used by the cluster-aware wrapper to
@@ -367,12 +447,9 @@ impl CredentialCache {
         identity: &PluginIdentity,
         plugin_id: &str,
         target: &str,
+        config: &serde_json::Value,
     ) -> Option<IssuedCredential> {
-        let key = CacheKey {
-            identity_hash: self.identity_hash(identity),
-            plugin_id: plugin_id.to_owned(),
-            target: target.to_owned(),
-        };
+        let key = self.key(identity, plugin_id, target, config);
         self.lookup(&key, Instant::now())
     }
 
@@ -483,13 +560,14 @@ mod tests {
             &self,
             _: &PluginIdentity,
             target: &str,
-            _: &serde_json::Value,
+            config: &serde_json::Value,
         ) -> Result<IssuedCredential, CredentialError> {
             self.issue_count.fetch_add(1, Ordering::SeqCst);
-            Ok(IssuedCredential::from_value(
-                format!("token-for-{target}"),
-                self.ttl_seconds,
-            ))
+            let value = match config.get("resource").and_then(serde_json::Value::as_str) {
+                Some(resource) => format!("token-for-{target}@{resource}"),
+                None => format!("token-for-{target}"),
+            };
+            Ok(IssuedCredential::from_value(value, self.ttl_seconds))
         }
     }
 
@@ -624,12 +702,120 @@ mod tests {
         let id = identity("alice");
         let cred = IssuedCredential::from_value("token", 60);
 
-        cache.insert_by_hash(identity_hash(&id), "p1".into(), "tgt".into(), cred.clone());
+        let cfg = serde_json::json!({});
+        cache.insert_by_hash(
+            identity_hash(&id),
+            "p1".into(),
+            "tgt".into(),
+            credential_config_hash(&cfg),
+            cred.clone(),
+        );
         assert_eq!(cache.len(), 1);
-        let got = cache.try_get(&id, "p1", "tgt");
+        let got = cache.try_get(&id, "p1", "tgt", &cfg);
         assert_eq!(got.unwrap().value, cred.value);
         cache.invalidate_by_hash(&identity_hash(&id), "p1", "tgt");
         assert_eq!(cache.len(), 0);
+    }
+
+    fn resource(uri: &str) -> serde_json::Value {
+        serde_json::json!({ "resource": uri })
+    }
+
+    #[tokio::test]
+    async fn two_resources_of_one_target_are_two_entries() {
+        let cache = CredentialCache::default();
+        let stub = Arc::new(StubIssuer::new("p1", 60));
+        let issuer: Arc<dyn CredentialIssuer> = stub.clone();
+        let id = identity("machine");
+        let a = resource("https://a.example.com/mcp");
+        let b = resource("https://b.example.com/mcp");
+
+        let first_a = cache.get_or_issue(&issuer, &id, "tgt", &a).await.unwrap();
+        let first_b = cache.get_or_issue(&issuer, &id, "tgt", &b).await.unwrap();
+        assert_eq!(cache.len(), 2);
+        assert_eq!(
+            first_a.value.as_deref(),
+            Some("token-for-tgt@https://a.example.com/mcp")
+        );
+        assert_eq!(
+            first_b.value.as_deref(),
+            Some("token-for-tgt@https://b.example.com/mcp")
+        );
+        // Repeat calls hit the entry of their own resource.
+        let again_a = cache.get_or_issue(&issuer, &id, "tgt", &a).await.unwrap();
+        let again_b = cache.get_or_issue(&issuer, &id, "tgt", &b).await.unwrap();
+        assert_eq!(again_a.value, first_a.value);
+        assert_eq!(again_b.value, first_b.value);
+        assert_eq!(stub.issue_count.load(Ordering::SeqCst), 2);
+        assert!(
+            cache
+                .try_get(&id, "p1", "tgt", &resource("https://c.example.com/mcp"))
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn invalidate_drops_every_config_of_the_target() {
+        let cache = CredentialCache::default();
+        let issuer: Arc<dyn CredentialIssuer> = Arc::new(StubIssuer::new("p1", 60));
+        let id = identity("machine");
+        for uri in ["https://a.example.com/mcp", "https://b.example.com/mcp"] {
+            cache
+                .get_or_issue(&issuer, &id, "tgt", &resource(uri))
+                .await
+                .unwrap();
+        }
+        cache
+            .get_or_issue(
+                &issuer,
+                &id,
+                "other",
+                &resource("https://a.example.com/mcp"),
+            )
+            .await
+            .unwrap();
+        cache.invalidate(&id, "p1", "tgt");
+        assert_eq!(cache.len(), 1, "only the other target stays");
+        cache.invalidate_by_hash(&identity_hash(&id), "p1", "other");
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn insert_by_hash_refuses_an_entry_without_a_config_hash() {
+        let cache = CredentialCache::default();
+        let id = identity("machine");
+        cache.insert_by_hash(
+            identity_hash(&id),
+            "p1".into(),
+            "tgt".into(),
+            String::new(),
+            IssuedCredential::from_value("token", 60),
+        );
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn config_hash_ignores_key_order_and_separates_values() {
+        let one: serde_json::Value =
+            serde_json::from_str(r#"{"resource":"https://a.example/mcp","audience":"x"}"#).unwrap();
+        let two: serde_json::Value =
+            serde_json::from_str(r#"{"audience":"x","resource":"https://a.example/mcp"}"#).unwrap();
+        assert_eq!(credential_config_hash(&one), credential_config_hash(&two));
+        let distinct = [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!([]),
+            serde_json::json!(""),
+            serde_json::json!({ "resource": "https://a.example/mcp" }),
+            serde_json::json!({ "resource": "https://b.example/mcp" }),
+            serde_json::json!({ "resource": ["https://a.example/mcp"] }),
+            serde_json::json!({ "scope": "a b" }),
+            serde_json::json!({ "scope": "a", "b": null }),
+        ];
+        let hashes: std::collections::BTreeSet<String> =
+            distinct.iter().map(credential_config_hash).collect();
+        assert_eq!(hashes.len(), distinct.len());
+        assert!(hashes.iter().all(|h| !h.is_empty()));
     }
 
     #[tokio::test]
@@ -808,7 +994,13 @@ mod tests {
                 .push((plugin_id.to_owned(), target.to_owned()));
         }));
 
-        cache.insert_by_hash(identity_hash(&id), "p1".into(), "tgt".into(), cred);
+        cache.insert_by_hash(
+            identity_hash(&id),
+            "p1".into(),
+            "tgt".into(),
+            credential_config_hash(&serde_json::Value::Null),
+            cred,
+        );
         cache.invalidate_by_hash(&identity_hash(&id), "p1", "tgt");
 
         let recorded = calls.lock().unwrap().clone();
